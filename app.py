@@ -3,9 +3,10 @@
 盤中大單進出監控 - 純富邦 WebSocket 版
 
 重點：
-1. 不使用 yfinance / 歷史資料 / MA / KD / 漲跌幅。
-2. 表格顯示：代碼｜股票名稱｜大單追蹤｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積，並新增儀表板。
-3. 修正「最新單筆」：富邦 trades 回傳的 volume 常是盤中累積量，本版會用「本次累積量 - 上次累積量」換算單筆增量。
+1. 富邦 WebSocket 負責盤中大單、單筆量、內外盤。
+2. yfinance 只用來抓「昨日收盤價」，一小時更新一次，並存入本地 JSON 歷史快取。
+3. 表格顯示：代碼｜股票名稱｜大單追蹤｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
+4. 修正「最新單筆」：富邦 trades 回傳的 volume 常是盤中累積量，本版會用「本次累積量 - 上次累積量」換算單筆增量。
 """
 
 import os
@@ -27,6 +28,11 @@ try:
 except Exception:
     FubonSDK = None
 
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
 st.set_page_config(page_title="盤中大單進出監控", layout="wide")
 
 TW_TZ = ZoneInfo("Asia/Taipei")
@@ -35,6 +41,8 @@ GROUPS_FILE = "stock_groups.json"
 BACKUP_DIR = "backups"
 STOCK_NAME_FILE = "TWstocklistname.txt"
 APP_LOGO = "jerry.jpg"
+YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
+YF_CLOSE_CACHE_TTL_SEC = 3600
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -50,37 +58,17 @@ DEFAULT_STOCK_GROUPS = {
 st.markdown(
     """
     <style>
-    .dashboard-grid {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(220px, 1fr));
-        gap: 12px;
-        margin: 10px 0 18px 0;
-    }
-    .dash-card {
-        border: 1px solid #91d5ff;
-        border-radius: 12px;
-        padding: 14px 16px;
-        min-height: 168px;
-        background: #f0f9ff;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-    }
-    .dash-card.hot {
-        border-color: #ff9c6e;
-        background: #fff7e6;
-    }
-    .dash-card.strong {
-        border-color: #95de64;
-        background: #f6ffed;
-    }
-    .dash-title {font-weight: 800; font-size: 18px; margin-bottom: 8px; color: #111827;}
-    .dash-big {font-size: 28px; font-weight: 900; margin: 4px 0 10px 0;}
-    .dash-line {font-size: 14px; line-height: 1.65; color: #111827;}
-    .dash-small {font-size: 12px; color: #6b7280; margin-top: 8px; border-top: 1px solid rgba(0,0,0,0.08); padding-top: 8px;}
-    .up-text {color:#cf1322; font-weight:700;}
-    .down-text {color:#389e0d; font-weight:700;}
-    .flat-text {color:#6b7280; font-weight:700;}
-    @media (max-width: 1200px) {.dashboard-grid {grid-template-columns: repeat(2, minmax(220px, 1fr));}}
-    @media (max-width: 700px) {.dashboard-grid {grid-template-columns: 1fr;}}
+    .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
+    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:170px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
+    .dash-card.hot {border-color:#ff9c6e; background:#fff7e6;}
+    .dash-card.strong {border-color:#95de64; background:#f6ffed;}
+    .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
+    .dash-big {font-size:28px; font-weight:900; margin:4px 0 10px 0;}
+    .dash-line {font-size:14px; line-height:1.65; color:#111827;}
+    .dash-small {font-size:12px; color:#4b5563; margin-top:8px; border-top:1px solid rgba(0,0,0,.08); padding-top:8px;}
+    .up-text {color:#cf1322; font-weight:700;} .down-text {color:#389e0d; font-weight:700;} .flat-text {color:#6b7280; font-weight:700;}
+    @media (max-width:1200px){.dashboard-grid{grid-template-columns:repeat(2,minmax(240px,1fr));}}
+    @media (max-width:700px){.dashboard-grid{grid-template-columns:1fr;}}
     </style>
     """,
     unsafe_allow_html=True,
@@ -94,7 +82,6 @@ def symbol_to_code(symbol: str) -> str:
 
 
 def format_pct_value(value):
-    """將漲幅數值格式化；台股慣例：上漲紅色、下跌綠色。"""
     if value is None:
         return "-"
     try:
@@ -124,6 +111,99 @@ def pct_class(value):
 
 def escape_html(text_value):
     return str(text_value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def build_yfinance_candidates(symbol: str):
+    raw = str(symbol).strip().upper()
+    code = symbol_to_code(raw)
+    candidates = []
+    if raw and "." in raw:
+        candidates.append(raw)
+    elif raw:
+        normalized = normalize_symbol_quick(raw)
+        if normalized:
+            candidates.append(normalized)
+    if code:
+        candidates.extend([f"{code}.TW", f"{code}.TWO"])
+    result, seen = [], set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def load_yf_close_cache():
+    if not os.path.exists(YF_CLOSE_CACHE_FILE):
+        return {}
+    try:
+        with open(YF_CLOSE_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_yf_close_cache(cache: dict):
+    try:
+        with open(YF_CLOSE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def get_yfinance_yesterday_close(symbol: str):
+    """取得昨日/前一交易日收盤價；一小時內讀本地 JSON 快取，超過才重新抓 yfinance。"""
+    code = symbol_to_code(symbol)
+    now_ts = time.time()
+    cache = load_yf_close_cache()
+    cached = cache.get(code)
+
+    if isinstance(cached, dict):
+        fetched_at = float(cached.get("fetched_at", 0) or 0)
+        close = cached.get("close")
+        if close is not None and now_ts - fetched_at < YF_CLOSE_CACHE_TTL_SEC:
+            return float(close), cached.get("date", ""), "cache"
+
+    if yf is None:
+        if isinstance(cached, dict) and cached.get("close") is not None:
+            return float(cached["close"]), cached.get("date", ""), "stale cache"
+        return None, "", "yfinance unavailable"
+
+    last_error = ""
+    today = datetime.now(TW_TZ).date()
+    for yf_symbol in build_yfinance_candidates(symbol):
+        try:
+            df = yf.download(yf_symbol, period="10d", interval="1d", auto_adjust=False, progress=False, threads=False)
+            if df is None or df.empty:
+                last_error = f"{yf_symbol}: no data"
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            df = df.reset_index()
+            date_col = "Date" if "Date" in df.columns else "Datetime" if "Datetime" in df.columns else df.columns[0]
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            df = df.dropna(subset=[date_col])
+            df = df[df[date_col].dt.date < today].sort_values(date_col)
+            if df.empty or "Close" not in df.columns:
+                last_error = f"{yf_symbol}: no previous close"
+                continue
+            close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+            if close.empty:
+                last_error = f"{yf_symbol}: close empty"
+                continue
+            close_value = float(close.iloc[-1])
+            close_date = pd.to_datetime(df.loc[close.index[-1], date_col]).date().isoformat()
+            cache[code] = {"symbol": yf_symbol, "close": close_value, "date": close_date, "fetched_at": now_ts, "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")}
+            save_yf_close_cache(cache)
+            return close_value, close_date, "yfinance"
+        except Exception as e:
+            last_error = f"{yf_symbol}: {e}"
+            continue
+
+    if isinstance(cached, dict) and cached.get("close") is not None:
+        return float(cached["close"]), cached.get("date", ""), "stale cache"
+    return None, "", last_error or "no data"
 
 
 def normalize_symbol_quick(input_text: str):
@@ -385,47 +465,6 @@ class FubonRealtimeManager:
                 return price
         return None
 
-    def _extract_reference_price(self, msg):
-        """嘗試從 WebSocket 訊息取得昨收 / 參考價，用於計算漲幅。"""
-        data = msg.get("data", {})
-        if not isinstance(data, dict):
-            data = {}
-        candidates = [
-            data.get("referencePrice"), data.get("reference_price"), data.get("refPrice"),
-            data.get("previousClose"), data.get("prevClose"), data.get("yesterdayClose"),
-            data.get("lastClose"), data.get("priorClose"),
-            msg.get("referencePrice"), msg.get("reference_price"), msg.get("refPrice"),
-            msg.get("previousClose"), msg.get("prevClose"), msg.get("yesterdayClose"),
-            msg.get("lastClose"), msg.get("priorClose"),
-        ]
-        for value in candidates:
-            ref = self._safe_float(value)
-            if ref is not None and ref > 0:
-                return ref
-        return None
-
-    def _extract_change_pct(self, msg, price=None, reference_price=None):
-        """優先讀取 WebSocket 的漲幅欄位；若沒有，使用 price / reference_price 計算。"""
-        data = msg.get("data", {})
-        if not isinstance(data, dict):
-            data = {}
-        candidates = [
-            data.get("changePercent"), data.get("changeRate"), data.get("changeRatio"),
-            data.get("percent"), data.get("pct"), data.get("priceChangeRate"),
-            msg.get("changePercent"), msg.get("changeRate"), msg.get("changeRatio"),
-            msg.get("percent"), msg.get("pct"), msg.get("priceChangeRate"),
-        ]
-        for value in candidates:
-            pct = self._safe_float(value)
-            if pct is not None:
-                # 有些 API 會用 0.0123 代表 1.23%，這裡做保守轉換。
-                if -1 < pct < 1 and pct != 0:
-                    pct *= 100
-                return pct
-        if price is not None and reference_price is not None and reference_price > 0:
-            return (float(price) / float(reference_price) - 1) * 100
-        return None
-
     def _extract_cumulative_volume(self, msg):
         """讀取富邦 trades 的累積成交量欄位。
 
@@ -481,18 +520,14 @@ class FubonRealtimeManager:
         price_text = f"@{price:.2f}" if isinstance(price, (int, float)) else ""
         volume = large_order.get("volume")
         trade_type = large_order.get("type") or "-"
-        change_pct = format_pct_value(large_order.get("change_pct"))
-        pct_text = "" if change_pct == "-" else f"｜{change_pct}"
         icon = "🚀" if trade_type == "外盤(買)" else "📉" if trade_type == "內盤(賣)" else "🔔"
-        return f"{icon} {time_text} {volume}張 {price_text} {trade_type}{pct_text}"
+        return f"{icon} {time_text} {volume}張 {price_text} {trade_type}"
 
     def _on_message(self, message):
         msg = self._parse_message(message)
         now = datetime.now(TW_TZ)
         symbol = self._extract_symbol(msg)
         price = self._extract_price(msg)
-        reference_price = self._extract_reference_price(msg)
-        change_pct = self._extract_change_pct(msg, price, reference_price)
         cumulative_volume = self._extract_cumulative_volume(msg)
         trade_type = self._extract_trade_type(msg, price)
 
@@ -504,8 +539,6 @@ class FubonRealtimeManager:
 
             status = self.tick_status.get(symbol, {
                 "last_ws_price": None,
-                "reference_price": None,
-                "change_pct": None,
                 "last_cumulative_volume": None,
                 "real_tick_volume": None,
                 "last_trade_type": "-",
@@ -516,12 +549,6 @@ class FubonRealtimeManager:
 
             if price is not None:
                 status["last_ws_price"] = price
-            if reference_price is not None:
-                status["reference_price"] = reference_price
-            if change_pct is not None:
-                status["change_pct"] = change_pct
-            elif status.get("last_ws_price") is not None and status.get("reference_price"):
-                status["change_pct"] = (float(status["last_ws_price"]) / float(status["reference_price"]) - 1) * 100
 
             # ===== 重點修正：累積量轉單筆量 =====
             # 富邦 trades 的 volume 常是「盤中累積成交量」。
@@ -559,7 +586,6 @@ class FubonRealtimeManager:
                         "price": status.get("last_ws_price"),
                         "volume": tick_volume,
                         "type": status.get("last_trade_type", "-"),
-                        "change_pct": status.get("change_pct"),
                     }
 
             self.tick_status[symbol] = status
@@ -594,8 +620,6 @@ class FubonRealtimeManager:
         with self.lock:
             status = copy.deepcopy(self.tick_status.get(code, {
                 "last_ws_price": None,
-                "reference_price": None,
-                "change_pct": None,
                 "last_cumulative_volume": None,
                 "real_tick_volume": None,
                 "last_trade_type": "-",
@@ -985,12 +1009,13 @@ if status["last_message_at"]:
 if status["error"]:
     st.error(status["error"])
 
-st.info("最新單筆已改為：目前累積成交量 - 上一次累積成交量；股價漲幅只使用富邦 WebSocket 回傳的漲幅欄位，或用即時價 / 參考價計算，不使用外部歷史資料。")
+st.info("最新單筆 = 富邦盤中累積成交量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
 
-# ===== 先整理所有分組資料，用同一份資料同時產生儀表板與下方表格 =====
+# ===== 先整理資料：同一份資料同時產生儀表板與表格 =====
 group_tables = {}
 dashboard_items = []
 recent_large_orders = []
+yf_source_count = {"yfinance": 0, "cache": 0, "stale cache": 0, "missing": 0}
 
 for group_name, stocks in st.session_state.stock_groups.items():
     rows = []
@@ -1007,8 +1032,20 @@ for group_name, stocks in st.session_state.stock_groups.items():
         stock_name = get_stock_name(symbol)
         order_status = manager.get_order_status(symbol, st.session_state.large_order_threshold) if manager is not None else {}
         tick_vol = order_status.get("real_tick_volume")
-        change_pct = order_status.get("change_pct")
+        current_price = order_status.get("last_ws_price")
+        yesterday_close, close_date, yf_source = get_yfinance_yesterday_close(symbol)
+        if yf_source in yf_source_count:
+            yf_source_count[yf_source] += 1
+        elif yesterday_close is None:
+            yf_source_count["missing"] += 1
+
+        change_pct = None
+        if current_price is not None and yesterday_close is not None and yesterday_close > 0:
+            change_pct = (float(current_price) / float(yesterday_close) - 1) * 100
+
         large_text = order_status.get("large_order_text", "監控中")
+        if large_text != "監控中" and change_pct is not None:
+            large_text = f"{large_text}｜{format_pct_value(change_pct)}"
         latest = order_status.get("latest_large_order")
         trade_type = order_status.get("last_trade_type", "-")
 
@@ -1024,15 +1061,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
                 large_buy_count += 1
             elif latest.get("type") == "內盤(賣)":
                 large_sell_count += 1
-            msg = {
-                "group": group_name,
-                "code": code,
-                "name": stock_name,
-                "text": large_text,
-                "time": latest.get("time"),
-                "pct": change_pct,
-                "type": latest.get("type", "-"),
-            }
+            msg = {"group": group_name, "code": code, "name": stock_name, "text": large_text, "time": latest.get("time"), "pct": change_pct, "type": latest.get("type", "-")}
             group_large_messages.append(msg)
             recent_large_orders.append(msg)
 
@@ -1045,6 +1074,8 @@ for group_name, stocks in st.session_state.stock_groups.items():
             "內外盤": trade_type,
             "外盤累積": int(order_status.get("total_buy_vol", 0) or 0),
             "內盤累積": int(order_status.get("total_sell_vol", 0) or 0),
+            "昨收日期": close_date or "-",
+            "昨收來源": yf_source,
         })
 
     top_pct_items.sort(key=lambda x: x["pct"], reverse=True)
@@ -1070,11 +1101,12 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "top_pct_text": top_pct_text,
         "large_msg_text": large_msg_text,
     })
-    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積"])
+    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
 
 # ===== 儀表板 =====
 st.markdown("### 📌 大單追蹤儀表板")
-st.caption(f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜漲幅達標門檻：≥ {pct_threshold:.1f}%")
+st.caption(f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜漲幅達標門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
+st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
 
 card_html_parts = ['<div class="dashboard-grid">']
 for item in dashboard_items:
@@ -1113,11 +1145,13 @@ for group_name, display_df in group_tables.items():
             "代碼": st.column_config.TextColumn("代碼"),
             "股票名稱": st.column_config.TextColumn("股票名稱"),
             "大單追蹤": st.column_config.TextColumn("大單追蹤", help="達到大單門檻時顯示最近一筆大單時間、張數、價格、內外盤與漲幅"),
-            "漲幅%": st.column_config.TextColumn("漲幅%", help="由富邦 WebSocket 的漲幅欄位或即時價 / 參考價計算；無欄位則顯示 -"),
+            "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦即時價 / yfinance 昨日收盤價 - 1"),
             "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
             "內盤累積": st.column_config.NumberColumn("內盤累積"),
+            "昨收日期": st.column_config.TextColumn("昨收日期"),
+            "昨收來源": st.column_config.TextColumn("昨收來源"),
         },
     )
 
