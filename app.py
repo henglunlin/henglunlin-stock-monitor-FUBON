@@ -17,6 +17,7 @@ import time
 import base64
 import tempfile
 import threading
+import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,20 @@ GROUPS_FILE = "stock_groups.json"
 BACKUP_DIR = "backups"
 STOCK_NAME_FILE = "TWstocklistname.txt"
 APP_LOGO = "jerry.jpg"
+
+
+def get_secret_or_default(key: str, default: str = ""):
+    """安全讀取 Streamlit Secrets；未設定時回傳預設值。"""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+# ===== Telegram 設定 =====
+TELEGRAM_BOT_TOKEN = get_secret_or_default("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
+
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
 
@@ -690,6 +705,28 @@ def save_backup_snapshot(groups):
 
 
 # =============================================================================
+# Telegram
+# =============================================================================
+def send_telegram_message(text: str):
+    """送出 Telegram 訊息；需要在 Streamlit secrets 設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code != 200:
+            st.error(f"Telegram 傳送失敗，API 回傳：{res.text}")
+    except Exception as e:
+        st.error(f"Telegram 連線失敗: {e}")
+
+
+# =============================================================================
 # Session State
 # =============================================================================
 if "auto_refresh_enabled" not in st.session_state:
@@ -718,6 +755,79 @@ if "fubon_manager" not in st.session_state:
     st.session_state.fubon_manager = FubonRealtimeManager()
 if "fubon_logged_in" not in st.session_state:
     st.session_state.fubon_logged_in = False
+if "tg_push_enabled" not in st.session_state:
+    st.session_state.tg_push_enabled = False
+if "large_order_toast_keys" not in st.session_state:
+    # 用來避免同一筆大單在自動刷新時重複跳出 toast / Telegram
+    st.session_state.large_order_toast_keys = set()
+if "_large_order_toast_messages" not in st.session_state:
+    # 大單買入 toast 佇列；資料掃描階段加入，畫面輸出前統一顯示
+    st.session_state._large_order_toast_messages = []
+
+
+def show_pending_toasts():
+    """顯示右上角 toast。duration='long' 約為 10 秒。"""
+    if "_quick_add_success_message" in st.session_state:
+        st.toast(st.session_state._quick_add_success_message, duration="long")
+        del st.session_state._quick_add_success_message
+
+    messages = st.session_state.get("_large_order_toast_messages", [])
+    if messages:
+        # 避免同一輪太多 toast 佔滿畫面，最多顯示最新 3 則
+        for msg in messages[-3:]:
+            st.toast(msg, icon="🚀", duration="long")
+        st.session_state._large_order_toast_messages = []
+
+
+def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
+    """偵測到外盤買入大單時，加入 toast 佇列；若 Telegram 開啟則同步推送。"""
+    if not latest or latest.get("type") != "外盤(買)":
+        return
+
+    order_time = latest.get("time")
+    time_key = order_time.strftime("%Y%m%d%H%M%S") if hasattr(order_time, "strftime") else str(order_time)
+    volume = int(latest.get("volume") or 0)
+    price = latest.get("price")
+    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}"
+
+    # 同一筆大單只通知一次，避免自動刷新時重複跳出 toast / Telegram
+    if toast_key in st.session_state.large_order_toast_keys:
+        return
+
+    time_text = order_time.strftime("%H:%M:%S") if hasattr(order_time, "strftime") else "--:--:--"
+    price_text = f"{float(price):.2f}" if isinstance(price, (int, float)) else "-"
+    pct_text = format_pct_value(change_pct)
+
+    toast_msg = (
+        f"🚀 大單買入偵測\n"
+        f"{group_name}｜{code} {stock_name}\n"
+        f"單筆：{volume} 張｜價格：{price_text}\n"
+        f"時間：{time_text}｜漲幅：{pct_text}"
+    )
+    st.session_state._large_order_toast_messages.append(toast_msg)
+
+    if st.session_state.get("tg_push_enabled", False):
+        yahoo_url = yahoo_quote_url(code)
+        telegram_msg = (
+            f"🚀 <b>大單買入偵測</b>\n"
+            f"分類：{group_name}\n"
+            f"股票：<a href='{yahoo_url}'>{code} {stock_name}</a>\n"
+            f"單筆：<b>{volume}</b> 張\n"
+            f"價格：<b>{price_text}</b>\n"
+            f"時間：{time_text}\n"
+            f"漲幅：{pct_text}"
+        )
+        send_telegram_message(telegram_msg)
+
+    st.session_state.large_order_toast_keys.add(toast_key)
+
+    # 控制記憶體，保留最近約 500 筆去重紀錄
+    if len(st.session_state.large_order_toast_keys) > 500:
+        st.session_state.large_order_toast_keys = set(list(st.session_state.large_order_toast_keys)[-300:])
+
+
+# 顯示上一輪 rerun 留下的提示，例如快速新增股票成功
+show_pending_toasts()
 
 
 def enter_edit_mode():
@@ -907,6 +1017,10 @@ def render_stock_group_editor():
                     st.session_state.stock_groups = groups
                     save_stock_groups(groups)
                     set_next_selected_group(selected_group)
+                    if stock_name:
+                        st.session_state._quick_add_success_message = f"已加入 {symbol}（{stock_name}）"
+                    else:
+                        st.session_state._quick_add_success_message = f"已加入 {symbol}"
                     st.rerun()
 
         c1, c2 = st.columns(2)
@@ -979,17 +1093,26 @@ if os.path.exists(APP_LOGO):
 else:
     st.markdown("## ⚡ 盤中大單進出監控")
 
-control_col1, control_col2, control_col3, control_col4, control_col5 = st.columns([1, 1, 1, 1, 1])
+control_col1, control_col2, control_col3, control_col4, control_col5, control_col6 = st.columns([1, 1, 1, 1, 1, 1])
 with control_col1:
     if st.button("🔄 手動刷新畫面", width="stretch"):
         st.rerun()
 with control_col2:
     st.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
 with control_col3:
-    st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
+    tg_push = st.toggle(
+        "📲 Telegram 推送開關",
+        value=st.session_state.tg_push_enabled,
+        help="必須開啟此選項，機器人才會發送大單買入推播",
+    )
+    if tg_push != st.session_state.tg_push_enabled:
+        st.session_state.tg_push_enabled = tg_push
+        st.rerun()
 with control_col4:
-    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
+    st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
 with control_col5:
+    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
+with control_col6:
     pct_threshold = st.number_input("漲幅門檻 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5)
 
 render_fubon_login()
@@ -1081,6 +1204,9 @@ for group_name, stocks in st.session_state.stock_groups.items():
             group_large_messages.append(msg)
             recent_large_orders.append(msg)
 
+            # ✅ 右上角 toast + Telegram：監控到「外盤(買)」大單時通知
+            queue_large_buy_toast(group_name, code, stock_name, latest, change_pct)
+
         rows.append({
             "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
@@ -1119,6 +1245,9 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "large_msg_text": large_msg_text,
     })
     group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
+
+# 顯示本輪掃描到的大單買入 toast
+show_pending_toasts()
 
 # ===== 儀表板 =====
 st.markdown('<div id="dashboard-top"></div>', unsafe_allow_html=True)
