@@ -73,6 +73,10 @@ DEFAULT_STOCK_GROUPS = {
 st.markdown(
     """
     <style>
+    html { scroll-behavior: smooth; }
+    .dashboard-link, .dashboard-link:link, .dashboard-link:visited, .dashboard-link:hover, .dashboard-link:active { text-decoration:none !important; color:inherit !important; display:block; }
+    .dash-card { cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; }
+    .dash-card:hover { transform:translateY(-2px); box-shadow:0 4px 10px rgba(0,0,0,.12); }
     .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
     .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:170px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
     .dash-card.hot {border-color:#ff9c6e; background:#fff7e6;}
@@ -100,6 +104,12 @@ def yahoo_quote_url(symbol: str) -> str:
     """產生 Yahoo 台股個股頁連結。"""
     code = symbol_to_code(symbol)
     return f"https://tw.stock.yahoo.com/quote/{code}"
+
+
+def make_anchor_id(group_name: str) -> str:
+    """將分類名稱轉成穩定的 HTML 錨點 ID，讓儀表板卡片可跳到對應表格。"""
+    anchor = re.sub(r"[^0-9A-Za-z一-鿿]+", "-", str(group_name)).strip("-")
+    return f"group-{anchor or 'default'}"
 
 
 def format_price_value(value):
@@ -1250,7 +1260,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
 show_pending_toasts()
 
 # ===== 儀表板 =====
-st.markdown('<div id="dashboard-top"></div>', unsafe_allow_html=True)
+st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
 st.markdown("### 📌 大單追蹤儀表板")
 st.caption(f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜漲幅達標門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
 st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
@@ -1258,7 +1268,9 @@ st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinan
 card_html_parts = ['<div class="dashboard-grid">']
 for item in dashboard_items:
     card_class = "dash-card hot" if item["large_order_count"] > 0 else "dash-card strong" if item["pct_hit_count"] > 0 else "dash-card"
+    anchor_id = make_anchor_id(item["group"])
     card_html_parts.append(
+        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])} 明細表">'
         f'<div class="{card_class}">'
         f'<div class="dash-title">{escape_html(item["group"])}</div>'
         f'<div class="dash-big">{item["large_order_count"]} / {item["total"]}</div>'
@@ -1266,7 +1278,7 @@ for item in dashboard_items:
         f'<div class="dash-line">📈 漲幅達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
         f'<div class="dash-small"><b>大單追蹤</b><br>{item["large_msg_text"]}</div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
-        f'</div>'
+        f'</div></a>'
     )
 card_html_parts.append('</div>')
 st.markdown("".join(card_html_parts), unsafe_allow_html=True)
@@ -1283,6 +1295,8 @@ st.divider()
 
 # ===== 明細表 =====
 for group_name, display_df in group_tables.items():
+    anchor_id = make_anchor_id(group_name)
+    st.markdown(f'<div id="{anchor_id}" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
     table_header_col1, table_header_col2 = st.columns([8, 2])
     with table_header_col1:
         st.subheader(f"【{group_name}】({len(display_df)}檔)")
