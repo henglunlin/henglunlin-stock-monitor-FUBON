@@ -3,9 +3,10 @@
 盤中大單進出監控 - 純富邦 WebSocket 版
 
 重點：
-1. 不使用 yfinance / 歷史資料 / MA / KD / 漲跌幅。
-2. 表格只顯示：代碼｜股票名稱｜大單追蹤｜最新單筆｜內外盤｜外盤累積｜內盤累積。
-3. 修正「最新單筆」：富邦 trades 回傳的 volume 常是盤中累積量，本版會用「本次累積量 - 上次累積量」換算單筆增量。
+1. 富邦 WebSocket 負責盤中大單、單筆量、內外盤。
+2. yfinance 只用來抓「昨日收盤價」，一小時更新一次，並存入本地 JSON 歷史快取。
+3. 表格顯示：代碼 Yahoo 連結｜股票名稱｜大單追蹤｜即時價｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
+4. 修正「最新單筆」：富邦 trades 回傳的 volume 常是盤中累積量，本版會用「本次累積量 - 上次累積量」換算單筆增量。
 """
 
 import os
@@ -42,22 +43,6 @@ STOCK_NAME_FILE = "TWstocklistname.txt"
 APP_LOGO = "jerry.jpg"
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
-FUBON_LOGIN_MAX_RETRY = 3
-
-st.markdown(
-    """
-    <style>
-    .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
-    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:170px; background:#f0f9ff;}
-    .dash-card.hot {border-color:#ff9c6e; background:#fff7e6;}
-    .dash-card.strong {border-color:#95de64; background:#f6ffed;}
-    .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
-    .dash-big {font-size:28px; font-weight:900; margin:4px 0 10px 0;}
-    .dash-line {font-size:14px; line-height:1.65; color:#111827;}
-    .dash-small {font-size:12px; color:#4b5563; margin-top:8px; border-top:1px solid rgba(0,0,0,.08); padding-top:8px;}
-    .up-text {color:#cf1322; font-weight:700;} .down-text {color:#389e0d; font-weight:700;} .flat-text {color:#6b7280; font-weight:700;}
-    </style>
-    """, unsafe_allow_html=True)
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -70,11 +55,46 @@ DEFAULT_STOCK_GROUPS = {
     ],
 }
 
+st.markdown(
+    """
+    <style>
+    .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
+    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:170px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
+    .dash-card.hot {border-color:#ff9c6e; background:#fff7e6;}
+    .dash-card.strong {border-color:#95de64; background:#f6ffed;}
+    .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
+    .dash-big {font-size:28px; font-weight:900; margin:4px 0 10px 0;}
+    .dash-line {font-size:14px; line-height:1.65; color:#111827;}
+    .dash-small {font-size:12px; color:#4b5563; margin-top:8px; border-top:1px solid rgba(0,0,0,.08); padding-top:8px;}
+    .up-text {color:#cf1322; font-weight:700;} .down-text {color:#389e0d; font-weight:700;} .flat-text {color:#6b7280; font-weight:700;}
+    @media (max-width:1200px){.dashboard-grid{grid-template-columns:repeat(2,minmax(240px,1fr));}}
+    @media (max-width:700px){.dashboard-grid{grid-template-columns:1fr;}}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # =============================================================================
 # 基礎工具
 # =============================================================================
 def symbol_to_code(symbol: str) -> str:
     return str(symbol).strip().upper().split(".")[0]
+
+
+def yahoo_quote_url(symbol: str) -> str:
+    """產生 Yahoo 台股個股頁連結。"""
+    code = symbol_to_code(symbol)
+    return f"https://tw.stock.yahoo.com/quote/{code}"
+
+
+def format_price_value(value):
+    """格式化富邦 WebSocket 即時價。"""
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.2f}"
+    except Exception:
+        return "-"
 
 
 def format_pct_value(value):
@@ -184,19 +204,13 @@ def get_yfinance_yesterday_close(symbol: str):
             if df.empty or "Close" not in df.columns:
                 last_error = f"{yf_symbol}: no previous close"
                 continue
-            close_series = pd.to_numeric(df["Close"], errors="coerce").dropna()
-            if close_series.empty:
+            close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+            if close.empty:
                 last_error = f"{yf_symbol}: close empty"
                 continue
-            close_value = float(close_series.iloc[-1])
-            close_date = pd.to_datetime(df.loc[close_series.index[-1], date_col]).date().isoformat()
-            cache[code] = {
-                "symbol": yf_symbol,
-                "close": close_value,
-                "date": close_date,
-                "fetched_at": now_ts,
-                "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-            }
+            close_value = float(close.iloc[-1])
+            close_date = pd.to_datetime(df.loc[close.index[-1], date_col]).date().isoformat()
+            cache[code] = {"symbol": yf_symbol, "close": close_value, "date": close_date, "fetched_at": now_ts, "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")}
             save_yf_close_cache(cache)
             return close_value, close_date, "yfinance"
         except Exception as e:
@@ -347,11 +361,7 @@ class FubonRealtimeManager:
 
     def login(self, fubon_id: str, fubon_password: str, cert_password: str, pfx_base64: str):
         if FubonSDK is None:
-            with self.lock:
-                self.error = "富邦 SDK 尚未安裝或載入失敗"
-            return False
-
-        # 先關閉舊連線，避免舊 session 卡住 WebSocket authentication handshake
+            raise RuntimeError("富邦 SDK 尚未安裝或載入失敗")
         try:
             if self.ws is not None:
                 self.ws.disconnect()
@@ -372,89 +382,54 @@ class FubonRealtimeManager:
         pfx_base64 = str(pfx_base64).strip()
         if "," in pfx_base64 and "base64" in pfx_base64[:80].lower():
             pfx_base64 = pfx_base64.split(",", 1)[1].strip()
-
         try:
             cert_bytes = base64.b64decode(pfx_base64, validate=True)
         except Exception as e:
-            with self.lock:
-                self.error = f"pfx_base64 不是有效的 Base64 憑證資料：{e}"
-            return False
+            raise RuntimeError(f"pfx_base64 不是有效的 Base64 憑證資料：{e}")
         if not cert_bytes:
-            with self.lock:
-                self.error = "pfx_base64 解碼後是空資料"
-            return False
+            raise RuntimeError("pfx_base64 解碼後是空資料")
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pfx")
         tmp.write(cert_bytes)
         tmp.close()
         self.cert_path = tmp.name
 
-        last_error = None
-        max_retry = int(globals().get("FUBON_LOGIN_MAX_RETRY", 3))
-
-        for attempt in range(1, max_retry + 1):
-            sdk = None
-            ws = None
+        sdk = None
+        ws = None
+        try:
+            sdk = FubonSDK()
+            login_result = sdk.login(fubon_id.strip().upper(), fubon_password, self.cert_path, cert_password)
+            is_success = getattr(login_result, "is_success", None)
+            message = getattr(login_result, "message", None)
+            if is_success is False:
+                raise RuntimeError(f"富邦登入失敗：{message or login_result}")
+            sdk.init_realtime()
+            ws = sdk.marketdata.websocket_client.stock
+            ws.on("message", self._on_message)
+            ws.connect()
+            with self.lock:
+                self.sdk = sdk
+                self.ws = ws
+                self.logged_in = True
+                self.connected = True
+                self.error = None
+        except Exception as e:
             try:
-                sdk = FubonSDK()
-                login_result = sdk.login(
-                    fubon_id.strip().upper(),
-                    fubon_password,
-                    self.cert_path,
-                    cert_password,
-                )
-
-                is_success = getattr(login_result, "is_success", None)
-                message = getattr(login_result, "message", None)
-                if is_success is False:
-                    with self.lock:
-                        self.error = f"富邦登入失敗：{message or login_result}"
-                    return False
-
-                sdk.init_realtime()
-                ws = sdk.marketdata.websocket_client.stock
-                ws.on("message", self._on_message)
-
-                # authentication timeout 常發生在這裡；失敗不讓整個 App 爆掉，而是記錄錯誤並 retry
-                ws.connect()
-
-                with self.lock:
-                    self.sdk = sdk
-                    self.ws = ws
-                    self.logged_in = True
-                    self.connected = True
-                    self.error = None
-                    self.subscribed = set()
-
-                return True
-
-            except Exception as e:
-                last_error = e
-                try:
-                    if ws is not None:
-                        ws.disconnect()
-                except Exception:
-                    pass
-
-                with self.lock:
-                    self.error = f"富邦 WebSocket 連線第 {attempt}/{max_retry} 次失敗：{e}"
-
-                if attempt < max_retry:
-                    time.sleep(2 * attempt)
-                    continue
-
-        with self.lock:
-            self.sdk = None
-            self.ws = None
-            self.logged_in = False
-            self.connected = False
-            self.error = f"富邦 WebSocket authentication timeout，已重試 {max_retry} 次仍失敗：{last_error}"
-            self.messages = {}
-            self.subscribed = set()
-            self.last_message_at = None
-            self.tick_status = {}
-
-        return False
+                if ws is not None:
+                    ws.disconnect()
+            except Exception:
+                pass
+            with self.lock:
+                self.sdk = None
+                self.ws = None
+                self.logged_in = False
+                self.connected = False
+                self.error = str(e)
+                self.messages = {}
+                self.subscribed = set()
+                self.last_message_at = None
+                self.tick_status = {}
+            raise
 
     def _parse_message(self, message):
         if isinstance(message, str):
@@ -719,8 +694,6 @@ def save_backup_snapshot(groups):
 # =============================================================================
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = True
-if "suppress_auto_refresh_once" not in st.session_state:
-    st.session_state.suppress_auto_refresh_once = False
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 if "large_order_threshold" not in st.session_state:
@@ -827,25 +800,19 @@ def render_fubon_login():
                 st.warning("請填寫完整登入資訊")
             else:
                 try:
-                    st.session_state.suppress_auto_refresh_once = True
                     new_manager = FubonRealtimeManager()
                     with st.spinner("連線富邦 WebSocket 中..."):
-                        login_ok = new_manager.login(f_id, f_pw, f_cert_pw, pfx_base64)
+                        new_manager.login(f_id, f_pw, f_cert_pw, pfx_base64)
                     st.session_state.fubon_manager = new_manager
-                    if login_ok:
-                        st.session_state.fubon_logged_in = True
-                        st.session_state.fubon_login_time = datetime.now(TW_TZ)
-                        st.success("富邦 WebSocket 連線成功")
-                        st.rerun()
-                    else:
-                        st.session_state.fubon_logged_in = False
-                        err = new_manager.get_status().get("error") or "富邦 WebSocket 連線失敗，請稍後再試"
-                        st.error(err)
-                        st.info("若是 authentication timeout，請等 10～20 秒後再按一次登入；不要連續快速按登入。")
+                    st.session_state.fubon_logged_in = True
+                    st.session_state.fubon_login_time = datetime.now(TW_TZ)
+                    st.success("富邦 WebSocket 連線成功")
+                    st.rerun()
                 except Exception as e:
-                    st.session_state.fubon_manager = new_manager if 'new_manager' in locals() else FubonRealtimeManager()
+                    st.session_state.fubon_manager = FubonRealtimeManager()
                     st.session_state.fubon_logged_in = False
-                    st.error(f"富邦登入流程發生未預期錯誤：{e}")
+                    st.error(f"富邦登入失敗：{e}")
+                    st.exception(e)
 
 
 # =============================================================================
@@ -1058,8 +1025,9 @@ if status["last_message_at"]:
 if status["error"]:
     st.error(status["error"])
 
-st.info("最新單筆 = 富邦盤中累積成交量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
+st.info("即時價由富邦 WebSocket trades 抓取；最新單筆 = 富邦盤中累積成交量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
 
+# ===== 先整理資料：同一份資料同時產生儀表板與表格 =====
 group_tables = {}
 dashboard_items = []
 recent_large_orders = []
@@ -1067,7 +1035,11 @@ yf_source_count = {"yfinance": 0, "cache": 0, "stale cache": 0, "missing": 0}
 
 for group_name, stocks in st.session_state.stock_groups.items():
     rows = []
-    large_order_count = large_buy_count = large_sell_count = pct_hit_count = known_pct_count = 0
+    large_order_count = 0
+    large_buy_count = 0
+    large_sell_count = 0
+    pct_hit_count = 0
+    known_pct_count = 0
     top_pct_items = []
     group_large_messages = []
 
@@ -1110,9 +1082,10 @@ for group_name, stocks in st.session_state.stock_groups.items():
             recent_large_orders.append(msg)
 
         rows.append({
-            "代碼": code,
+            "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
             "大單追蹤": large_text,
+            "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
             "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
             "內外盤": trade_type,
@@ -1123,13 +1096,32 @@ for group_name, stocks in st.session_state.stock_groups.items():
         })
 
     top_pct_items.sort(key=lambda x: x["pct"], reverse=True)
-    top_pct_text = "｜".join([f'<span class="{pct_class(item["pct"])}">{escape_html(item["code"])} {escape_html(item["name"])} {item["pct"]:+.2f}%</span>' for item in top_pct_items[:3]]) or "尚無漲幅資料"
+    top_pct_text = "｜".join([
+        f'<span class="{pct_class(item["pct"])}">{escape_html(item["code"])} {escape_html(item["name"])} {item["pct"]:+.2f}%</span>'
+        for item in top_pct_items[:3]
+    ]) or "尚無漲幅資料"
+
     group_large_messages.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
-    large_msg_text = "<br>".join([f'▸ {escape_html(item["code"])} {escape_html(item["name"])}：{escape_html(item["text"])}' for item in group_large_messages[:3]]) or "尚無大單"
+    large_msg_text = "<br>".join([
+        f'▸ {escape_html(item["code"])} {escape_html(item["name"])}：{escape_html(item["text"])}'
+        for item in group_large_messages[:3]
+    ]) or "尚無大單"
 
-    dashboard_items.append({"group": group_name, "total": len(stocks), "large_order_count": large_order_count, "large_buy_count": large_buy_count, "large_sell_count": large_sell_count, "pct_hit_count": pct_hit_count, "known_pct_count": known_pct_count, "top_pct_text": top_pct_text, "large_msg_text": large_msg_text})
-    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
+    dashboard_items.append({
+        "group": group_name,
+        "total": len(stocks),
+        "large_order_count": large_order_count,
+        "large_buy_count": large_buy_count,
+        "large_sell_count": large_sell_count,
+        "pct_hit_count": pct_hit_count,
+        "known_pct_count": known_pct_count,
+        "top_pct_text": top_pct_text,
+        "large_msg_text": large_msg_text,
+    })
+    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
 
+# ===== 儀表板 =====
+st.markdown('<div id="dashboard-top"></div>', unsafe_allow_html=True)
 st.markdown("### 📌 大單追蹤儀表板")
 st.caption(f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜漲幅達標門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
 st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
@@ -1138,12 +1130,14 @@ card_html_parts = ['<div class="dashboard-grid">']
 for item in dashboard_items:
     card_class = "dash-card hot" if item["large_order_count"] > 0 else "dash-card strong" if item["pct_hit_count"] > 0 else "dash-card"
     card_html_parts.append(
-        f'<div class="{card_class}"><div class="dash-title">{escape_html(item["group"])}</div>'
+        f'<div class="{card_class}">'
+        f'<div class="dash-title">{escape_html(item["group"])}</div>'
         f'<div class="dash-big">{item["large_order_count"]} / {item["total"]}</div>'
         f'<div class="dash-line">🚀 外盤大單：<b>{item["large_buy_count"]}</b>　📉 內盤大單：<b>{item["large_sell_count"]}</b></div>'
         f'<div class="dash-line">📈 漲幅達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
         f'<div class="dash-small"><b>大單追蹤</b><br>{item["large_msg_text"]}</div>'
-        f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div></div>'
+        f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
+        f'</div>'
     )
 card_html_parts.append('</div>')
 st.markdown("".join(card_html_parts), unsafe_allow_html=True)
@@ -1158,17 +1152,29 @@ if recent_large_orders:
 
 st.divider()
 
+# ===== 明細表 =====
 for group_name, display_df in group_tables.items():
-    st.subheader(f"【{group_name}】({len(display_df)}檔)")
+    table_header_col1, table_header_col2 = st.columns([8, 2])
+    with table_header_col1:
+        st.subheader(f"【{group_name}】({len(display_df)}檔)")
+    with table_header_col2:
+        st.markdown(
+            '<div style="text-align:right; padding-top: 0.6rem;">'
+            '<a href="#dashboard-top">⬆️ 返回儀表板</a>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
     st.dataframe(
         display_df,
         width="stretch",
         hide_index=True,
         column_config={
-            "代碼": st.column_config.TextColumn("代碼"),
+            "代碼": st.column_config.LinkColumn("代碼", help="點擊前往 Yahoo 台股個股頁", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
             "股票名稱": st.column_config.TextColumn("股票名稱"),
             "大單追蹤": st.column_config.TextColumn("大單追蹤", help="達到大單門檻時顯示最近一筆大單時間、張數、價格、內外盤與漲幅"),
-            "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦即時價 / yfinance 昨日收盤價 - 1"),
+            "即時價": st.column_config.TextColumn("即時價", help="由富邦 WebSocket trades 即時成交價取得"),
+            "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1"),
             "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
@@ -1187,8 +1193,6 @@ with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
     else:
         st.caption("尚未收到此代碼的 WebSocket 訊息")
 
-if st.session_state.get("suppress_auto_refresh_once", False):
-    st.session_state.suppress_auto_refresh_once = False
-elif st.session_state.auto_refresh_enabled and not st.session_state.group_editor_unlocked and not st.session_state.editing_mode:
+if st.session_state.auto_refresh_enabled and not st.session_state.group_editor_unlocked and not st.session_state.editing_mode:
     time.sleep(int(st.session_state.refresh_sec))
     st.rerun()
