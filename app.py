@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-單純盤中大單監控版：只使用富邦 WebSocket trades
-已移除：第三方歷史資料、MA/KD/漲跌幅、Yahoo fallback、儀表板統計
-表格只顯示：代碼｜股票名稱｜大單追蹤｜最新單筆｜內外盤｜外盤累積｜內盤累積
+盤中大單進出監控 - 純富邦 WebSocket 版
+
+重點：
+1. 不使用 yfinance / 歷史資料 / MA / KD / 漲跌幅。
+2. 表格只顯示：代碼｜股票名稱｜大單追蹤｜最新單筆｜內外盤｜外盤累積｜內盤累積。
+3. 修正「最新單筆」：富邦 trades 回傳的 volume 常是盤中累積量，本版會用「本次累積量 - 上次累積量」換算單筆增量。
 """
 
 import os
@@ -19,16 +22,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-# ===== 富邦 API 引入 =====
 try:
     from fubon_neo.sdk import FubonSDK
 except Exception:
     FubonSDK = None
 
-# ===== Streamlit UI 基本設定 =====
-st.set_page_config(page_title="盤中大單監控", layout="wide")
+st.set_page_config(page_title="盤中大單進出監控", layout="wide")
 
-# ===== 常數設定 =====
 TW_TZ = ZoneInfo("Asia/Taipei")
 GROUP_EDIT_PIN = "1219"
 GROUPS_FILE = "stock_groups.json"
@@ -87,13 +87,8 @@ def normalize_symbols_from_text(text: str):
     return result
 
 
-def make_anchor_id(group_name: str) -> str:
-    anchor = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "-", group_name).strip("-")
-    return f"group-{anchor}"
-
-
 # =============================================================================
-# 股票名稱 / 查詢：只讀本地 TWstocklistname.txt，不使用外部歷史資料套件
+# 股票名稱 / 查詢：只讀本地 TWstocklistname.txt
 # =============================================================================
 @st.cache_data(ttl=86400)
 def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
@@ -109,13 +104,11 @@ def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
             line = raw_line.strip().replace("\ufeff", "").replace("\u3000", " ")
             if not line:
                 continue
-
             if "\t" in line:
                 parts = [p.strip() for p in line.split("\t") if p.strip()]
             else:
                 m = re.match(r"^([^\s]+)\s+(.+)$", line)
                 parts = [m.group(1).strip(), m.group(2).strip()] if m else []
-
             if len(parts) < 2:
                 continue
 
@@ -125,7 +118,6 @@ def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
             code = symbol_to_code(symbol)
             if not code or not stock_name:
                 continue
-
             code_to_name[code] = stock_name
             code_to_symbol[code] = symbol
             name_to_symbol[stock_name] = symbol
@@ -145,7 +137,6 @@ def resolve_stock_query(input_text: str):
     q_raw = str(input_text).strip()
     if not q_raw:
         return None, None, None
-
     lookup = load_stock_lookup_maps(STOCK_NAME_FILE)
     code_to_name = lookup.get("code_to_name", {})
     code_to_symbol = lookup.get("code_to_symbol", {})
@@ -153,14 +144,11 @@ def resolve_stock_query(input_text: str):
 
     q_upper = q_raw.upper()
     if "." in q_upper:
-        symbol = q_upper
-        code = symbol_to_code(symbol)
-        return symbol, code_to_name.get(code, code), "ticker"
-
+        code = symbol_to_code(q_upper)
+        return q_upper, code_to_name.get(code, code), "ticker"
     if q_upper.isdigit():
-        code = q_upper
-        symbol = code_to_symbol.get(code) or normalize_symbol_quick(code)
-        return symbol, code_to_name.get(code, code), "code"
+        symbol = code_to_symbol.get(q_upper) or normalize_symbol_quick(q_upper)
+        return symbol, code_to_name.get(q_upper, q_upper), "code"
 
     symbol = name_to_symbol.get(q_raw) or name_to_symbol.get(q_raw.replace(" ", ""))
     if symbol:
@@ -177,12 +165,11 @@ def resolve_stock_query(input_text: str):
     if symbol:
         code = symbol_to_code(symbol)
         return symbol, code_to_name.get(code, code), "fallback"
-
     return None, None, None
 
 
 # =============================================================================
-# 富邦 WebSocket：只負責盤中大單、單筆量、內外盤
+# 富邦 WebSocket Manager
 # =============================================================================
 class FubonRealtimeManager:
     def __init__(self):
@@ -207,7 +194,6 @@ class FubonRealtimeManager:
     def login(self, fubon_id: str, fubon_password: str, cert_password: str, pfx_base64: str):
         if FubonSDK is None:
             raise RuntimeError("富邦 SDK 尚未安裝或載入失敗")
-
         try:
             if self.ws is not None:
                 self.ws.disconnect()
@@ -228,7 +214,6 @@ class FubonRealtimeManager:
         pfx_base64 = str(pfx_base64).strip()
         if "," in pfx_base64 and "base64" in pfx_base64[:80].lower():
             pfx_base64 = pfx_base64.split(",", 1)[1].strip()
-
         try:
             cert_bytes = base64.b64decode(pfx_base64, validate=True)
         except Exception as e:
@@ -250,12 +235,10 @@ class FubonRealtimeManager:
             message = getattr(login_result, "message", None)
             if is_success is False:
                 raise RuntimeError(f"富邦登入失敗：{message or login_result}")
-
             sdk.init_realtime()
             ws = sdk.marketdata.websocket_client.stock
             ws.on("message", self._on_message)
             ws.connect()
-
             with self.lock:
                 self.sdk = sdk
                 self.ws = ws
@@ -330,15 +313,20 @@ class FubonRealtimeManager:
                 return price
         return None
 
-    def _extract_tick_volume(self, msg):
+    def _extract_cumulative_volume(self, msg):
+        """讀取富邦 trades 的累積成交量欄位。
+
+        目前畫面中「最新單筆」出現 14780、95466 等大數字，代表來源欄位其實是盤中累積成交量，
+        所以不能直接顯示；必須在 _on_message 內用差值換算單筆量。
+        """
         data = msg.get("data", {})
         if not isinstance(data, dict):
             data = {}
         candidates = [
-            data.get("volume"), data.get("tradeVolume"), data.get("trade_volume"),
-            data.get("size"), data.get("quantity"), data.get("qty"), data.get("unit"),
-            msg.get("volume"), msg.get("tradeVolume"), msg.get("trade_volume"),
-            msg.get("size"), msg.get("quantity"), msg.get("qty"), msg.get("unit"),
+            data.get("volume"), data.get("tradeVolume"), data.get("totalVolume"), data.get("total_volume"),
+            data.get("accVolume"), data.get("accTradeVolume"), data.get("cumulativeVolume"),
+            msg.get("volume"), msg.get("tradeVolume"), msg.get("totalVolume"), msg.get("total_volume"),
+            msg.get("accVolume"), msg.get("accTradeVolume"), msg.get("cumulativeVolume"),
         ]
         for value in candidates:
             volume = self._safe_int(value)
@@ -350,22 +338,18 @@ class FubonRealtimeManager:
         data = msg.get("data", {})
         if not isinstance(data, dict):
             data = {}
-
         candidates = [
-            data.get("tradeType"), data.get("tickType"), data.get("type"),
-            data.get("side"), data.get("dealType"),
-            msg.get("tradeType"), msg.get("tickType"), msg.get("type"),
-            msg.get("side"), msg.get("dealType"),
+            data.get("tradeType"), data.get("tickType"), data.get("type"), data.get("side"), data.get("dealType"),
+            msg.get("tradeType"), msg.get("tickType"), msg.get("type"), msg.get("side"), msg.get("dealType"),
         ]
         raw_type = next((str(x).strip() for x in candidates if x is not None and str(x).strip()), "")
         raw_upper = raw_type.upper()
-
         if raw_upper in ["BUY", "B", "BID", "外盤", "外盤(買)", "買", "1"]:
             return "外盤(買)"
         if raw_upper in ["SELL", "S", "ASK", "內盤", "內盤(賣)", "賣", "2"]:
             return "內盤(賣)"
 
-        # 備援：成交價與買一/賣一比較
+        # 若未提供內外盤欄位，嘗試用成交價與買一/賣一判斷。
         if price is not None:
             bid = self._safe_float(data.get("bid") or data.get("bidPrice") or data.get("bestBidPrice") or msg.get("bid") or msg.get("bidPrice"))
             ask = self._safe_float(data.get("ask") or data.get("askPrice") or data.get("bestAskPrice") or msg.get("ask") or msg.get("askPrice"))
@@ -392,17 +376,18 @@ class FubonRealtimeManager:
         now = datetime.now(TW_TZ)
         symbol = self._extract_symbol(msg)
         price = self._extract_price(msg)
-        tick_volume = self._extract_tick_volume(msg)
+        cumulative_volume = self._extract_cumulative_volume(msg)
         trade_type = self._extract_trade_type(msg, price)
 
         with self.lock:
             self.last_message_at = now
             if not symbol:
                 return
-
             self.messages[symbol] = {"time": now, "raw": msg}
+
             status = self.tick_status.get(symbol, {
                 "last_ws_price": None,
+                "last_cumulative_volume": None,
                 "real_tick_volume": None,
                 "last_trade_type": "-",
                 "total_buy_vol": 0,
@@ -412,16 +397,44 @@ class FubonRealtimeManager:
 
             if price is not None:
                 status["last_ws_price"] = price
+
+            # ===== 重點修正：累積量轉單筆量 =====
+            # 富邦 trades 的 volume 常是「盤中累積成交量」。
+            # 第一筆收到時沒有前值可扣，因此不當作單筆大單；第二筆後用差值才是真正最新單筆。
+            tick_volume = None
+            if cumulative_volume is not None:
+                prev_cum = status.get("last_cumulative_volume")
+                if prev_cum is not None:
+                    diff = int(cumulative_volume) - int(prev_cum)
+                    if diff > 0:
+                        tick_volume = diff
+                    elif diff == 0:
+                        tick_volume = 0
+                    else:
+                        # 可能跨日、重連或資料重置，先重設基準，不用負數。
+                        tick_volume = None
+                status["last_cumulative_volume"] = int(cumulative_volume)
+
             if tick_volume is not None:
                 status["real_tick_volume"] = tick_volume
 
             if trade_type:
                 status["last_trade_type"] = trade_type
-                if tick_volume is not None:
-                    if trade_type == "外盤(買)":
-                        status["total_buy_vol"] = int(status.get("total_buy_vol", 0) or 0) + tick_volume
-                    elif trade_type == "內盤(賣)":
-                        status["total_sell_vol"] = int(status.get("total_sell_vol", 0) or 0) + tick_volume
+
+            if tick_volume is not None and tick_volume > 0:
+                if trade_type == "外盤(買)":
+                    status["total_buy_vol"] = int(status.get("total_buy_vol", 0) or 0) + tick_volume
+                elif trade_type == "內盤(賣)":
+                    status["total_sell_vol"] = int(status.get("total_sell_vol", 0) or 0) + tick_volume
+
+                threshold = int(st.session_state.get("large_order_threshold", 50) or 50)
+                if tick_volume >= threshold:
+                    status["latest_large_order"] = {
+                        "time": now,
+                        "price": status.get("last_ws_price"),
+                        "volume": tick_volume,
+                        "type": status.get("last_trade_type", "-"),
+                    }
 
             self.tick_status[symbol] = status
 
@@ -455,31 +468,16 @@ class FubonRealtimeManager:
         with self.lock:
             status = copy.deepcopy(self.tick_status.get(code, {
                 "last_ws_price": None,
+                "last_cumulative_volume": None,
                 "real_tick_volume": None,
                 "last_trade_type": "-",
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
                 "latest_large_order": None,
             }))
-
-        tick_volume = status.get("real_tick_volume")
-        if tick_volume is not None and tick_volume >= threshold:
-            latest = status.get("latest_large_order")
-            # 同一筆量重複 rerun 不覆寫時間；新大單才更新
-            if latest is None or latest.get("volume") != tick_volume or latest.get("price") != status.get("last_ws_price"):
-                status["latest_large_order"] = {
-                    "time": datetime.now(TW_TZ),
-                    "price": status.get("last_ws_price"),
-                    "volume": tick_volume,
-                    "type": status.get("last_trade_type", "-"),
-                }
-                with self.lock:
-                    if code in self.tick_status:
-                        self.tick_status[code]["latest_large_order"] = status["latest_large_order"]
-
-        latest_large_order = status.get("latest_large_order")
-        if latest_large_order and int(latest_large_order.get("volume") or 0) >= threshold:
-            status["large_order_text"] = self._format_large_order_text(latest_large_order)
+        latest = status.get("latest_large_order")
+        if latest and int(latest.get("volume") or 0) >= threshold:
+            status["large_order_text"] = self._format_large_order_text(latest)
         else:
             status["large_order_text"] = "監控中"
         return status
@@ -496,7 +494,7 @@ class FubonRealtimeManager:
 
 
 # =============================================================================
-# 分組讀寫 / 備份
+# 分組讀寫
 # =============================================================================
 def load_stock_groups():
     if os.path.exists(GROUPS_FILE):
@@ -515,14 +513,9 @@ def save_stock_groups(groups):
         json.dump(groups, f, ensure_ascii=False, indent=2)
 
 
-def ensure_backup_dir():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-
 def save_backup_snapshot(groups):
-    ensure_backup_dir()
-    filename = f"stock_groups_backup_{datetime.now(TW_TZ).strftime('%Y%m%d_%H%M%S')}.json"
-    file_path = os.path.join(BACKUP_DIR, filename)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    file_path = os.path.join(BACKUP_DIR, f"stock_groups_backup_{datetime.now(TW_TZ).strftime('%Y%m%d_%H%M%S')}.json")
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(groups, f, ensure_ascii=False, indent=2)
     return file_path
@@ -535,6 +528,8 @@ if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = True
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
+if "large_order_threshold" not in st.session_state:
+    st.session_state.large_order_threshold = 50
 if "stock_groups" not in st.session_state:
     st.session_state.stock_groups = load_stock_groups()
 if "group_editor_unlocked" not in st.session_state:
@@ -579,7 +574,7 @@ if "_next_selected_group" in st.session_state:
 
 
 # =============================================================================
-# 富邦登入 UI
+# UI：富邦登入
 # =============================================================================
 def get_fubon_pfx_base64():
     try:
@@ -610,7 +605,6 @@ def render_fubon_login():
             st.sidebar.caption(f"最後資料：{status['last_message_at'].strftime('%H:%M:%S')}")
         if status["error"]:
             st.sidebar.warning(status["error"])
-
         c1, c2 = st.sidebar.columns(2)
         with c1:
             if st.button("盤中累積歸零", width="stretch"):
@@ -654,7 +648,7 @@ def render_fubon_login():
 
 
 # =============================================================================
-# 分組 UI
+# UI：分組編輯
 # =============================================================================
 def sync_editor_fields_from_selected_group():
     groups = st.session_state.stock_groups
@@ -725,7 +719,7 @@ def render_stock_group_editor():
         st.markdown("### ⚡ 快速新增股票")
         quick_input = st.text_input("輸入股票代碼或名稱", key="quick_add_symbol_input", on_change=enter_edit_mode)
         if quick_input.strip():
-            symbol, stock_name, resolved_type = resolve_stock_query(quick_input)
+            symbol, stock_name, _ = resolve_stock_query(quick_input)
             if symbol:
                 st.caption(f"查詢結果：{stock_name} / 將加入：{symbol}")
             else:
@@ -779,7 +773,6 @@ def render_stock_group_editor():
     with st.sidebar.expander("📦 匯出 / 匯入 / 重設", expanded=False):
         export_json = json.dumps(st.session_state.stock_groups, ensure_ascii=False, indent=2)
         st.download_button("⬇️ 匯出目前分組 JSON", data=export_json, file_name="stock_groups.json", mime="application/json", width="stretch")
-
         uploaded_file = st.file_uploader("上傳股票分組 JSON", type=["json"])
         if uploaded_file is not None and st.button("📥 匯入並覆蓋目前分組", width="stretch"):
             try:
@@ -827,7 +820,7 @@ with control_col2:
 with control_col3:
     st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
 with control_col4:
-    large_order_threshold = st.number_input("大單門檻（張）", min_value=1, value=50, step=10)
+    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
 
 render_fubon_login()
 render_group_editor_lock()
@@ -838,7 +831,6 @@ else:
 
 manager = st.session_state.fubon_manager
 
-# 連線後訂閱所有股票
 if st.session_state.fubon_logged_in:
     login_time = st.session_state.get("fubon_login_time")
     can_subscribe = True
@@ -863,23 +855,21 @@ if status["last_message_at"]:
 if status["error"]:
     st.error(status["error"])
 
+st.info("最新單筆已改為：目前累積成交量 - 上一次累積成交量。剛連線第一筆因沒有前值，會先顯示 '-'，下一筆開始才會顯示真正單筆量。")
 st.divider()
 
-# 只產生大單監控表格，不抓外部歷史資料，不算任何技術指標
 for group_name, stocks in st.session_state.stock_groups.items():
-    anchor_id = make_anchor_id(group_name)
-    st.markdown(f'<div id="{anchor_id}"></div>', unsafe_allow_html=True)
     st.subheader(f"【{group_name}】({len(stocks)}檔)")
-
     rows = []
     for symbol in stocks:
         stock_name = get_stock_name(symbol)
-        order_status = manager.get_order_status(symbol, large_order_threshold) if manager is not None else {}
+        order_status = manager.get_order_status(symbol, st.session_state.large_order_threshold) if manager is not None else {}
+        tick_vol = order_status.get("real_tick_volume")
         rows.append({
             "代碼": symbol_to_code(symbol),
             "股票名稱": stock_name,
             "大單追蹤": order_status.get("large_order_text", "監控中"),
-            "最新單筆": "-" if order_status.get("real_tick_volume") is None else f"{order_status.get('real_tick_volume')} 張",
+            "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
             "內外盤": order_status.get("last_trade_type", "-"),
             "外盤累積": int(order_status.get("total_buy_vol", 0) or 0),
             "內盤累積": int(order_status.get("total_sell_vol", 0) or 0),
@@ -894,14 +884,13 @@ for group_name, stocks in st.session_state.stock_groups.items():
             "代碼": st.column_config.TextColumn("代碼"),
             "股票名稱": st.column_config.TextColumn("股票名稱"),
             "大單追蹤": st.column_config.TextColumn("大單追蹤", help="達到大單門檻時顯示最近一筆大單時間、張數、價格與內外盤"),
-            "最新單筆": st.column_config.TextColumn("最新單筆"),
+            "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
             "內盤累積": st.column_config.NumberColumn("內盤累積"),
         },
     )
 
-# Debug 保留，方便確認富邦 WebSocket 真實欄位名稱
 with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
     debug_code = st.text_input("輸入代碼看最後 WS 原始訊息", value="2330")
     msg = manager.get_message(debug_code)
@@ -911,7 +900,6 @@ with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
     else:
         st.caption("尚未收到此代碼的 WebSocket 訊息")
 
-# 自動刷新：分組編輯時暫停，避免輸入被重刷打斷
 if st.session_state.auto_refresh_enabled and not st.session_state.group_editor_unlocked and not st.session_state.editing_mode:
     time.sleep(int(st.session_state.refresh_sec))
     st.rerun()
