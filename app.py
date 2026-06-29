@@ -7,7 +7,6 @@
 2. yfinance 只用來抓「昨日收盤價」，一小時更新一次，並存入本地 JSON 歷史快取。
 3. 表格顯示：代碼｜股票名稱｜大單追蹤｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
 4. 修正「最新單筆」：富邦 trades 回傳的 volume 常是盤中累積量，本版會用「本次累積量 - 上次累積量」換算單筆增量。
-5. 富邦 WebSocket 登入加入 authentication timeout 自動重試。
 """
 
 import os
@@ -44,7 +43,6 @@ STOCK_NAME_FILE = "TWstocklistname.txt"
 APP_LOGO = "jerry.jpg"
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
-FUBON_LOGIN_MAX_RETRY = 3
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -190,19 +188,13 @@ def get_yfinance_yesterday_close(symbol: str):
             if df.empty or "Close" not in df.columns:
                 last_error = f"{yf_symbol}: no previous close"
                 continue
-            close_series = pd.to_numeric(df["Close"], errors="coerce").dropna()
-            if close_series.empty:
+            close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+            if close.empty:
                 last_error = f"{yf_symbol}: close empty"
                 continue
-            close_value = float(close_series.iloc[-1])
-            close_date = pd.to_datetime(df.loc[close_series.index[-1], date_col]).date().isoformat()
-            cache[code] = {
-                "symbol": yf_symbol,
-                "close": close_value,
-                "date": close_date,
-                "fetched_at": now_ts,
-                "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-            }
+            close_value = float(close.iloc[-1])
+            close_date = pd.to_datetime(df.loc[close.index[-1], date_col]).date().isoformat()
+            cache[code] = {"symbol": yf_symbol, "close": close_value, "date": close_date, "fetched_at": now_ts, "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")}
             save_yf_close_cache(cache)
             return close_value, close_date, "yfinance"
         except Exception as e:
@@ -354,8 +346,6 @@ class FubonRealtimeManager:
     def login(self, fubon_id: str, fubon_password: str, cert_password: str, pfx_base64: str):
         if FubonSDK is None:
             raise RuntimeError("富邦 SDK 尚未安裝或載入失敗")
-
-        # 先關閉舊連線，避免舊 session 卡住 WebSocket authentication handshake
         try:
             if self.ws is not None:
                 self.ws.disconnect()
@@ -376,7 +366,6 @@ class FubonRealtimeManager:
         pfx_base64 = str(pfx_base64).strip()
         if "," in pfx_base64 and "base64" in pfx_base64[:80].lower():
             pfx_base64 = pfx_base64.split(",", 1)[1].strip()
-
         try:
             cert_bytes = base64.b64decode(pfx_base64, validate=True)
         except Exception as e:
@@ -389,69 +378,42 @@ class FubonRealtimeManager:
         tmp.close()
         self.cert_path = tmp.name
 
-        last_error = None
-
-        for attempt in range(1, FUBON_LOGIN_MAX_RETRY + 1):
-            sdk = None
-            ws = None
+        sdk = None
+        ws = None
+        try:
+            sdk = FubonSDK()
+            login_result = sdk.login(fubon_id.strip().upper(), fubon_password, self.cert_path, cert_password)
+            is_success = getattr(login_result, "is_success", None)
+            message = getattr(login_result, "message", None)
+            if is_success is False:
+                raise RuntimeError(f"富邦登入失敗：{message or login_result}")
+            sdk.init_realtime()
+            ws = sdk.marketdata.websocket_client.stock
+            ws.on("message", self._on_message)
+            ws.connect()
+            with self.lock:
+                self.sdk = sdk
+                self.ws = ws
+                self.logged_in = True
+                self.connected = True
+                self.error = None
+        except Exception as e:
             try:
-                sdk = FubonSDK()
-                login_result = sdk.login(
-                    fubon_id.strip().upper(),
-                    fubon_password,
-                    self.cert_path,
-                    cert_password,
-                )
-
-                is_success = getattr(login_result, "is_success", None)
-                message = getattr(login_result, "message", None)
-                if is_success is False:
-                    raise RuntimeError(f"富邦登入失敗：{message or login_result}")
-
-                sdk.init_realtime()
-                ws = sdk.marketdata.websocket_client.stock
-                ws.on("message", self._on_message)
-
-                # authentication timeout 常發生在這裡，失敗會進入 retry
-                ws.connect()
-
-                with self.lock:
-                    self.sdk = sdk
-                    self.ws = ws
-                    self.logged_in = True
-                    self.connected = True
-                    self.error = None
-                    self.subscribed = set()
-
-                return
-
-            except Exception as e:
-                last_error = e
-                try:
-                    if ws is not None:
-                        ws.disconnect()
-                except Exception:
-                    pass
-
-                with self.lock:
-                    self.error = f"富邦 WebSocket 連線第 {attempt}/{FUBON_LOGIN_MAX_RETRY} 次失敗：{e}"
-
-                if attempt < FUBON_LOGIN_MAX_RETRY:
-                    time.sleep(2 * attempt)
-                    continue
-
-        with self.lock:
-            self.sdk = None
-            self.ws = None
-            self.logged_in = False
-            self.connected = False
-            self.error = f"富邦 WebSocket authentication timeout，已重試 {FUBON_LOGIN_MAX_RETRY} 次仍失敗：{last_error}"
-            self.messages = {}
-            self.subscribed = set()
-            self.last_message_at = None
-            self.tick_status = {}
-
-        raise RuntimeError(f"富邦 WebSocket authentication timeout，已重試 {FUBON_LOGIN_MAX_RETRY} 次仍失敗：{last_error}")
+                if ws is not None:
+                    ws.disconnect()
+            except Exception:
+                pass
+            with self.lock:
+                self.sdk = None
+                self.ws = None
+                self.logged_in = False
+                self.connected = False
+                self.error = str(e)
+                self.messages = {}
+                self.subscribed = set()
+                self.last_message_at = None
+                self.tick_status = {}
+            raise
 
     def _parse_message(self, message):
         if isinstance(message, str):
@@ -818,7 +780,6 @@ def render_fubon_login():
         f_pw = st.text_input("富邦登入密碼", key="fubon_pw_input", type="password")
         f_cert_pw = st.text_input("憑證密碼", key="fubon_cert_pw_input", type="password")
         if st.button("連線富邦 WebSocket", width="stretch"):
-            st.session_state.auto_refresh_enabled = False
             if not f_id or not f_pw or not f_cert_pw:
                 st.warning("請填寫完整登入資訊")
             else:
