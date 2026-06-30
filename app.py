@@ -1144,7 +1144,7 @@ with control_col3:
 with control_col4:
     st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
 with control_col5:
-    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
+    st.number_input("大單門檻（張）", min_value=1, step=5, key="large_order_threshold")
 with control_col6:
     st.number_input(
         "推送漲跌幅門檻 (%)",
