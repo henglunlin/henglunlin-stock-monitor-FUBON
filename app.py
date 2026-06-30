@@ -676,18 +676,18 @@ class FubonRealtimeManager:
             return copy.deepcopy(self.messages.get(code))
 
     def _is_large_order(self, order, threshold: int):
-        # 大單判定：固定張數門檻，或單筆量 >= 近 10 單均量的 1.3 倍。
+        # 大單判定：固定張數門檻，或單筆量 >= 最新單筆近10筆平均。
         if not order:
             return False, "-"
         volume = int(order.get("volume") or 0)
         fixed_hit = volume >= int(threshold)
         avg_10 = order.get("avg_10_volume")
-        avg_hit = bool(avg_10 and avg_10 > 0 and volume >= float(avg_10) * 1.3)
+        avg_hit = bool(avg_10 and avg_10 > 0 and volume >= float(avg_10))
         reasons = []
         if fixed_hit:
             reasons.append(f"固定門檻≥{int(threshold)}張")
         if avg_hit:
-            reasons.append("近10均量×1.3")
+            reasons.append("最新10筆均量")
         return fixed_hit or avg_hit, " + ".join(reasons) if reasons else "-"
 
     def get_order_status(self, symbol: str, large_order_threshold: int = 50):
@@ -1348,7 +1348,7 @@ show_pending_toasts()
 # ===== 儀表板 =====
 st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
 st.markdown("### 📌 大單追蹤儀表板")
-st.caption(f"大單判定：單筆 ≥ {st.session_state.large_order_threshold} 張，或單筆 ≥ 近10單均量 × 1.3｜Telegram 推送：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}% 且有大單｜儀表板漲幅門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
+st.caption(f"大單判定：單筆 ≥ {st.session_state.large_order_threshold} 張，或單筆 ≥ 最新10筆均量｜Telegram 推送：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}% 且有大單｜儀表板漲幅門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
 st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
 
 card_html_parts = ['<div class="dashboard-grid">']
@@ -1406,7 +1406,7 @@ for group_name, display_df in group_tables.items():
             "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1"),
             "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
             "近10均量": st.column_config.TextColumn("近10均量", help="此股票最近最多 10 筆單量平均；不足 10 筆時先用已收到筆數計算"),
-            "大單判定": st.column_config.TextColumn("大單判定", help="固定張數門檻，或近10均量×1.3"),
+            "大單判定": st.column_config.TextColumn("大單判定", help="固定張數門檻，或最新10筆均量"),
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
             "內盤累積": st.column_config.NumberColumn("內盤累積"),
