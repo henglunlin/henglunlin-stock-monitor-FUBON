@@ -78,7 +78,12 @@ st.markdown(
     .dash-card { cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; }
     .dash-card:hover { transform:translateY(-2px); box-shadow:0 4px 10px rgba(0,0,0,.12); }
     .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
-    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:170px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
+    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:190px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
+    /* 儀表板顏色依「漲幅達標比例」分級：0%、1~39%、40~69%、70%以上 */
+    .dash-card.pct-zero {border-color:#d9d9d9; background:#fafafa;}
+    .dash-card.pct-low {border-color:#91d5ff; background:#f0f9ff;}
+    .dash-card.pct-mid {border-color:#ffd666; background:#fffbe6;}
+    .dash-card.pct-high {border-color:#ff7875; background:#fff1f0; box-shadow:0 1px 8px rgba(207,19,34,.18);}
     .dash-card.hot {border-color:#ff9c6e; background:#fff7e6;}
     .dash-card.strong {border-color:#95de64; background:#f6ffed;}
     .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
@@ -1205,6 +1210,8 @@ for group_name, stocks in st.session_state.stock_groups.items():
     large_sell_count = 0
     pct_hit_count = 0
     known_pct_count = 0
+    up_count = 0
+    down_count = 0
     top_pct_items = []
     group_large_messages = []
 
@@ -1232,6 +1239,10 @@ for group_name, stocks in st.session_state.stock_groups.items():
 
         if change_pct is not None:
             known_pct_count += 1
+            if float(change_pct) > 0:
+                up_count += 1
+            elif float(change_pct) < 0:
+                down_count += 1
             top_pct_items.append({"code": code, "name": stock_name, "pct": float(change_pct)})
             if float(change_pct) >= float(pct_threshold):
                 pct_hit_count += 1
@@ -1275,6 +1286,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
         for item in group_large_messages[:3]
     ]) or "尚無大單"
 
+    pct_hit_ratio = (pct_hit_count / len(stocks) * 100) if len(stocks) else 0
     dashboard_items.append({
         "group": group_name,
         "total": len(stocks),
@@ -1283,6 +1295,9 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "large_sell_count": large_sell_count,
         "pct_hit_count": pct_hit_count,
         "known_pct_count": known_pct_count,
+        "pct_hit_ratio": pct_hit_ratio,
+        "up_count": up_count,
+        "down_count": down_count,
         "top_pct_text": top_pct_text,
         "large_msg_text": large_msg_text,
     })
@@ -1299,14 +1314,24 @@ st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinan
 
 card_html_parts = ['<div class="dashboard-grid">']
 for item in dashboard_items:
-    card_class = "dash-card hot" if item["large_order_count"] > 0 else "dash-card strong" if item["pct_hit_count"] > 0 else "dash-card"
+    pct_ratio = float(item.get("pct_hit_ratio", 0) or 0)
+    if pct_ratio >= 70:
+        card_class = "dash-card pct-high"
+    elif pct_ratio >= 40:
+        card_class = "dash-card pct-mid"
+    elif pct_ratio > 0:
+        card_class = "dash-card pct-low"
+    else:
+        card_class = "dash-card pct-zero"
     anchor_id = make_anchor_id(item["group"])
     card_html_parts.append(
-        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])} 明細表">'
+        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])} 明細表；大數字 = 漲幅達標檔數 / 分組總檔數">'
         f'<div class="{card_class}">'
         f'<div class="dash-title">{escape_html(item["group"])}</div>'
         f'<div class="dash-big">{item["pct_hit_count"]} / {item["total"]}</div>'
-        f'<div class="dash-line">📈 漲幅達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
+        f'<div class="dash-line">漲幅達標比例（≥{pct_threshold:.1f}%）：<b>{item["pct_hit_ratio"]:.0f}%</b></div>'
+        f'<div class="dash-line">🎯 達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
+        f'<div class="dash-line">🔴 一般上漲：<b>{item["up_count"]}</b>　🟢 下跌：<b>{item["down_count"]}</b></div>'
         f'<div class="dash-line">🚀 外盤大單：<b>{item["large_buy_count"]}</b>　📉 內盤大單：<b>{item["large_sell_count"]}</b></div>'
         f'<div class="dash-small"><b>大單追蹤</b><br>{item["large_msg_text"]}</div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
