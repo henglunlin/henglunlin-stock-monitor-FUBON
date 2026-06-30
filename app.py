@@ -587,6 +587,8 @@ class FubonRealtimeManager:
                 "total_sell_vol": 0,
                 "tick_volume_history": [],
                 "recent_tick_orders": [],
+                "current_avg_10_volume": None,
+                "current_avg_multiple": None,
                 "latest_large_order": None,
             })
 
@@ -623,10 +625,13 @@ class FubonRealtimeManager:
                     status["total_sell_vol"] = int(status.get("total_sell_vol", 0) or 0) + tick_volume
 
                 # 不在 WebSocket callback 內用固定門檻過濾；UI 改門檻後可即時套用。
-                # 近10均量以「目前這筆之前」最近10筆單量計算，避免當下大單稀釋自己的比較基準。
+                # 近10均量用「包含目前這筆」的最近最多10筆單量計算，確保表格能即時顯示均量。
                 history = [int(v) for v in status.get("tick_volume_history", []) if int(v) > 0]
-                avg_10 = round(sum(history[-10:]) / len(history[-10:]), 2) if len(history) >= 10 else None
+                history.append(int(tick_volume))
+                history = history[-10:]
+                avg_10 = round(sum(history) / len(history), 2) if history else None
                 avg_multiple = round(float(tick_volume) / avg_10, 2) if avg_10 and avg_10 > 0 else None
+
                 tick_order = {
                     "time": now,
                     "price": status.get("last_ws_price"),
@@ -634,12 +639,14 @@ class FubonRealtimeManager:
                     "type": status.get("last_trade_type", "-"),
                     "avg_10_volume": avg_10,
                     "avg_multiple": avg_multiple,
+                    "sample_count": len(history),
                 }
                 recent_orders = status.get("recent_tick_orders", [])
                 recent_orders.append(tick_order)
                 status["recent_tick_orders"] = recent_orders[-200:]
-                history.append(int(tick_volume))
-                status["tick_volume_history"] = history[-10:]
+                status["tick_volume_history"] = history
+                status["current_avg_10_volume"] = avg_10
+                status["current_avg_multiple"] = avg_multiple
                 status["latest_large_order"] = tick_order
 
             self.tick_status[symbol] = status
@@ -696,8 +703,16 @@ class FubonRealtimeManager:
                 "total_sell_vol": 0,
                 "tick_volume_history": [],
                 "recent_tick_orders": [],
+                "current_avg_10_volume": None,
+                "current_avg_multiple": None,
                 "latest_large_order": None,
             }))
+
+        # 若 current_avg_10_volume 尚未存在，從 tick_volume_history 補算，避免舊 session 顯示 -。
+        history = [int(v) for v in status.get("tick_volume_history", []) if int(v) > 0]
+        if history and not status.get("current_avg_10_volume"):
+            status["current_avg_10_volume"] = round(sum(history[-10:]) / len(history[-10:]), 2)
+
         latest_large = None
         large_reason = "-"
         for order in reversed(status.get("recent_tick_orders", [])):
@@ -706,13 +721,16 @@ class FubonRealtimeManager:
                 latest_large = order
                 large_reason = reason
                 break
+
         status["latest_large_order"] = latest_large
         status["large_order_reason"] = large_reason
         status["is_large_order"] = latest_large is not None
         if latest_large:
-            avg_10 = latest_large.get("avg_10_volume")
+            avg_10 = latest_large.get("avg_10_volume") or status.get("current_avg_10_volume")
             multiple = latest_large.get("avg_multiple")
-            avg_text = f"｜近10均量 {avg_10:.1f}張 / {multiple:.2f}倍" if avg_10 and multiple else ""
+            avg_text = f"｜近10均量 {avg_10:.1f}張" if avg_10 else ""
+            if multiple:
+                avg_text += f" / {multiple:.2f}倍"
             status["large_order_text"] = f"{self._format_large_order_text(latest_large)}｜{large_reason}{avg_text}"
         else:
             status["large_order_text"] = "監控中"
@@ -1290,7 +1308,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
             "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
             "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
-            "近10均量": "-" if not latest or not latest.get("avg_10_volume") else f"{float(latest.get('avg_10_volume')):.1f} 張",
+            "近10均量": "-" if not order_status.get("current_avg_10_volume") else f"{float(order_status.get('current_avg_10_volume')):.1f} 張",
             "大單判定": order_status.get("large_order_reason", "-"),
             "內外盤": trade_type,
             "外盤累積": int(order_status.get("total_buy_vol", 0) or 0),
@@ -1387,7 +1405,7 @@ for group_name, display_df in group_tables.items():
             "即時價": st.column_config.TextColumn("即時價", help="由富邦 WebSocket trades 即時成交價取得"),
             "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1"),
             "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
-            "近10均量": st.column_config.TextColumn("近10均量", help="以此股票最近 10 筆單量計算；單筆超過 1.3 倍也視為大單"),
+            "近10均量": st.column_config.TextColumn("近10均量", help="此股票最近最多 10 筆單量平均；不足 10 筆時先用已收到筆數計算"),
             "大單判定": st.column_config.TextColumn("大單判定", help="固定張數門檻，或近10均量×1.3"),
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
