@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-
-def yahoo_quote_url(symbol: str) -> str:
-    """產生 Yahoo 台股個股頁連結."""
-
-    code = symbol.split('.')[0]
-
-    return f"https://tw.stock.yahoo.com/quote/{code}"
-
 """
 盤中大單進出監控 - 純富邦 WebSocket 版
 
@@ -66,6 +58,7 @@ TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
 
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
+DEFAULT_LARGE_ORDER_THRESHOLD = 5  # 預設大單門檻；之後以 UI 即時值為準
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -82,67 +75,35 @@ st.markdown(
     """
     <style>
     html { scroll-behavior: smooth; }
-
-    .dashboard-link,
-    .dashboard-link:link,
-    .dashboard-link:visited,
-    .dashboard-link:hover,
-    .dashboard-link:active {
-        text-decoration: none !important;
-        color: inherit !important;
-        display: block;
-    }
-
-    .dash-card {
-        cursor:pointer;
-        transition:transform .12s ease, box-shadow .12s ease;
-    }
-
-    .dash-card:hover {
-        transform:translateY(-2px);
-        box-shadow:0 4px 10px rgba(0,0,0,.12);
-    }
-
-    .dashboard-grid {
-        display:grid;
-        grid-template-columns:repeat(4,minmax(240px,1fr));
-        gap:12px;
-        margin:10px 0 18px 0;
-    }
-
-    .dash-card {
-        border:1px solid #91d5ff;
-        border-radius:12px;
-        padding:14px 16px;
-        min-height:190px;
-        background:#f0f9ff;
-        box-shadow:0 1px 2px rgba(0,0,0,.04);
-        color:#111827;   /* ✅ 預設深字 */
-    }
-
-    /* ✅ 顏色分級 */
-    .dash-card.pct-zero {
-        border-color:#d9d9d9;
-        background:#fafafa;
-        color:#6b7280;
-    }
-
-    .dash-card.pct-low {
-        border-color:#91d5ff;
-        background:#f0f9ff;
-        color:#111827;
-    }
-
-    .dash-card.pct-mid {
-        border-color:#ffd666;
-        background:#fffbe6;
-        color:#7a4e00;
-    }
-
-    .dash-card.pct-high {
-        border-color:#ff7875;
-        background:#fff1f0;
-
+    .dashboard-link, .dashboard-link:link, .dashboard-link:visited, .dashboard-link:hover, .dashboard-link:active { text-decoration:none !important; color:inherit !important; display:block; }
+    .dash-card { cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; }
+    .dash-card:hover { transform:translateY(-2px); box-shadow:0 4px 10px rgba(0,0,0,.18); }
+    .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
+    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:190px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04); color:#111827;}
+    /* 儀表板顏色依「漲幅達標比例」分級：0%、1~39%、40~69%、70%以上 */
+    .dash-card.pct-zero {border-color:#d9d9d9; background:#fafafa; color:#374151;}
+    .dash-card.pct-low {border-color:#91d5ff; background:#f0f9ff; color:#111827;}
+    .dash-card.pct-mid {border-color:#ffd666; background:#fffbe6; color:#111827;}
+    .dash-card.pct-high {border-color:#ff7875; background:#fff1f0; color:#111827; box-shadow:0 1px 8px rgba(207,19,34,.18);}
+    .dash-card.hot {border-color:#ff9c6e; background:#fff7e6; color:#111827;}
+    .dash-card.strong {border-color:#95de64; background:#f6ffed; color:#111827;}
+    .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
+    .dash-big {font-size:30px; font-weight:900; margin:4px 0 10px 0; color:#111827 !important; text-shadow:none; letter-spacing:.3px;}
+    .dash-card.pct-zero .dash-big {color:#374151 !important;}
+    .dash-card.pct-low .dash-big {color:#0f172a !important;}
+    .dash-card.pct-mid .dash-big {color:#7a4e00 !important;}
+    .dash-card.pct-high .dash-big {color:#b91c1c !important; text-shadow:0 1px 1px rgba(255,255,255,.65);}
+    .dash-line {font-size:14px; line-height:1.65; color:#111827;}
+    .dash-small {font-size:12px; color:#374151; margin-top:8px; border-top:1px solid rgba(0,0,0,.10); padding-top:8px;}
+    .dash-card.pct-high .dash-small, .dash-card.pct-high .dash-line, .dash-card.pct-high .dash-title {color:#111827;}
+    .dash-card.pct-mid .dash-small, .dash-card.pct-mid .dash-line, .dash-card.pct-mid .dash-title {color:#111827;}
+    .up-text {color:#cf1322; font-weight:700;} .down-text {color:#389e0d; font-weight:700;} .flat-text {color:#6b7280; font-weight:700;}
+    @media (max-width:1200px){.dashboard-grid{grid-template-columns:repeat(2,minmax(240px,1fr));}}
+    @media (max-width:700px){.dashboard-grid{grid-template-columns:1fr;}}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =============================================================================
 # 基礎工具
@@ -578,6 +539,21 @@ class FubonRealtimeManager:
                 return volume
         return None
 
+    def _extract_tick_size(self, msg):
+        """讀取富邦 trades 的單筆成交量欄位；size 才是單筆，volume 多半是盤中累積量。"""
+        data = msg.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+        candidates = [
+            data.get("size"), data.get("tradeSize"), data.get("trade_size"), data.get("quantity"), data.get("qty"),
+            msg.get("size"), msg.get("tradeSize"), msg.get("trade_size"), msg.get("quantity"), msg.get("qty"),
+        ]
+        for value in candidates:
+            size = self._safe_int(value)
+            if size is not None:
+                return size
+        return None
+
     def _extract_trade_type(self, msg, price=None):
         data = msg.get("data", {})
         if not isinstance(data, dict):
@@ -620,6 +596,7 @@ class FubonRealtimeManager:
         now = datetime.now(TW_TZ)
         symbol = self._extract_symbol(msg)
         price = self._extract_price(msg)
+        direct_tick_size = self._extract_tick_size(msg)
         cumulative_volume = self._extract_cumulative_volume(msg)
         trade_type = self._extract_trade_type(msg, price)
 
@@ -647,7 +624,13 @@ class FubonRealtimeManager:
             # 富邦 trades 的 volume 常是「盤中累積成交量」。
             # 第一筆收到時沒有前值可扣，因此不當作單筆大單；第二筆後用差值才是真正最新單筆。
             tick_volume = None
-            if cumulative_volume is not None:
+            # 富邦 trades payload 若有 size，size 才是單筆成交量；volume 多半是盤中累積量。
+            # 例如 Debug：size=11、volume=230，應判斷 11 張，而不是把 230 當最新單筆。
+            if direct_tick_size is not None:
+                tick_volume = int(direct_tick_size)
+                if cumulative_volume is not None:
+                    status["last_cumulative_volume"] = int(cumulative_volume)
+            elif cumulative_volume is not None:
                 prev_cum = status.get("last_cumulative_volume")
                 if prev_cum is not None:
                     diff = int(cumulative_volume) - int(prev_cum)
@@ -710,9 +693,12 @@ class FubonRealtimeManager:
         with self.lock:
             return copy.deepcopy(self.messages.get(code))
 
-    def get_order_status(self, symbol: str, large_order_threshold: int = 50):
+    def get_order_status(self, symbol: str, large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD):
         code = symbol_to_code(symbol)
-        threshold = int(large_order_threshold or 50)
+        try:
+            threshold = max(1, int(large_order_threshold))
+        except Exception:
+            threshold = DEFAULT_LARGE_ORDER_THRESHOLD
         with self.lock:
             status = copy.deepcopy(self.tick_status.get(code, {
                 "last_ws_price": None,
@@ -737,6 +723,31 @@ class FubonRealtimeManager:
         else:
             status["large_order_text"] = "監控中"
         return status
+
+
+    def get_recent_large_orders(self, symbol: str, large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD, limit: int = 50):
+        """回傳最近符合目前大單門檻的所有成交，不只回傳最後一筆。"""
+        code = symbol_to_code(symbol)
+        try:
+            threshold = max(1, int(large_order_threshold))
+        except Exception:
+            threshold = DEFAULT_LARGE_ORDER_THRESHOLD
+        try:
+            limit = max(1, int(limit))
+        except Exception:
+            limit = 50
+        with self.lock:
+            status = copy.deepcopy(self.tick_status.get(code, {"recent_tick_orders": []}))
+        orders = []
+        for order in status.get("recent_tick_orders", []):
+            try:
+                volume = int(order.get("volume") or 0)
+            except Exception:
+                volume = 0
+            if volume >= threshold:
+                orders.append(order)
+        orders.sort(key=lambda x: x.get("time") or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
+        return orders[:limit]
 
     def get_status(self):
         with self.lock:
@@ -807,7 +818,7 @@ if "auto_refresh_enabled" not in st.session_state:
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 if "large_order_threshold" not in st.session_state:
-    st.session_state.large_order_threshold = 50
+    st.session_state.large_order_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
 if "telegram_pct_threshold" not in st.session_state:
     st.session_state.telegram_pct_threshold = 3.0
 if "stock_groups" not in st.session_state:
@@ -842,6 +853,9 @@ if "_large_order_toast_messages" not in st.session_state:
 
 def show_pending_toasts():
     """顯示右上角 toast。duration='long' 約為 10 秒。"""
+    if "_threshold_changed_message" in st.session_state:
+        st.toast(st.session_state._threshold_changed_message, icon="✅", duration="long")
+        del st.session_state._threshold_changed_message
     if "_quick_add_success_message" in st.session_state:
         st.toast(st.session_state._quick_add_success_message, duration="long")
         del st.session_state._quick_add_success_message
@@ -863,7 +877,7 @@ def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
     time_key = order_time.strftime("%Y%m%d%H%M%S") if hasattr(order_time, "strftime") else str(order_time)
     volume = int(latest.get("volume") or 0)
     price = latest.get("price")
-    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}"
+    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}_th{st.session_state.get('large_order_threshold', DEFAULT_LARGE_ORDER_THRESHOLD)}"
 
     # 同一筆大單只通知一次，避免自動刷新時重複跳出 toast / Telegram
     if toast_key in st.session_state.large_order_toast_keys:
@@ -912,6 +926,17 @@ def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
 
 # 顯示上一輪 rerun 留下的提示，例如快速新增股票成功
 show_pending_toasts()
+
+
+def on_large_order_threshold_change():
+    """大單門檻變更時立即同步，並清掉通知去重快取。"""
+    try:
+        new_threshold = max(1, int(st.session_state.get("large_order_threshold", DEFAULT_LARGE_ORDER_THRESHOLD)))
+    except Exception:
+        new_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
+    st.session_state.large_order_threshold = new_threshold
+    st.session_state.large_order_toast_keys = set()
+    st.session_state._threshold_changed_message = f"大單門檻已即時更新為 {new_threshold} 張，並重新掃描最近成交。"
 
 
 def enter_edit_mode():
@@ -1195,7 +1220,7 @@ with control_col3:
 with control_col4:
     st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
 with control_col5:
-    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
+    st.number_input("大單門檻（張）", min_value=1, step=1, key="large_order_threshold", on_change=on_large_order_threshold_change, help="調整後會立即用新門檻重新掃描最近 200 筆單筆成交。")
 with control_col6:
     st.number_input(
         "推送漲跌幅門檻 (%)",
@@ -1241,7 +1266,8 @@ if status["last_message_at"]:
 if status["error"]:
     st.error(status["error"])
 
-st.info("即時價由富邦 WebSocket trades 抓取；最新單筆 = 富邦盤中累積成交量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
+st.info("即時價由富邦 WebSocket trades 抓取；最新單筆優先使用富邦 trades 的 size 單筆成交量；若無 size 才用累積量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
+st.caption(f"✅ 目前實際掃描大單門檻：單筆 ≥ {int(st.session_state.large_order_threshold)} 張")
 
 # ===== 先整理資料：同一份資料同時產生儀表板與表格 =====
 group_tables = {}
@@ -1265,6 +1291,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
         code = symbol_to_code(symbol)
         stock_name = get_stock_name(symbol)
         order_status = manager.get_order_status(symbol, st.session_state.large_order_threshold) if manager is not None else {}
+        qualifying_orders = manager.get_recent_large_orders(symbol, st.session_state.large_order_threshold, limit=20) if manager is not None else []
         tick_vol = order_status.get("real_tick_volume")
         current_price = order_status.get("last_ws_price")
         yesterday_close, close_date, yf_source = get_yfinance_yesterday_close(symbol)
@@ -1293,23 +1320,26 @@ for group_name, stocks in st.session_state.stock_groups.items():
             if float(change_pct) >= float(pct_threshold):
                 pct_hit_count += 1
 
-        if latest:
+        if qualifying_orders:
             large_order_count += 1
-            if latest.get("type") == "外盤(買)":
+            if any(o.get("type") == "外盤(買)" for o in qualifying_orders):
                 large_buy_count += 1
-            elif latest.get("type") == "內盤(賣)":
+            if any(o.get("type") == "內盤(賣)" for o in qualifying_orders):
                 large_sell_count += 1
-            msg = {"group": group_name, "code": code, "name": stock_name, "text": large_text, "time": latest.get("time"), "pct": change_pct, "type": latest.get("type", "-")}
-            group_large_messages.append(msg)
-            recent_large_orders.append(msg)
-
-            # ✅ 右上角 toast + Telegram：監控到「外盤(買)」大單時通知
-            queue_large_buy_toast(group_name, code, stock_name, latest, change_pct)
+            for order in qualifying_orders[:5]:
+                order_text = manager._format_large_order_text(order)
+                if change_pct is not None:
+                    order_text = f"{order_text}｜{format_pct_value(change_pct)}"
+                msg = {"group": group_name, "code": code, "name": stock_name, "text": order_text, "time": order.get("time"), "pct": change_pct, "type": order.get("type", "-")}
+                group_large_messages.append(msg)
+                recent_large_orders.append(msg)
+                queue_large_buy_toast(group_name, code, stock_name, order, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
             "大單追蹤": large_text,
+            "符合門檻筆數": len(qualifying_orders),
             "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
             "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
@@ -1347,7 +1377,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "top_pct_text": top_pct_text,
         "large_msg_text": large_msg_text,
     })
-    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
+    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "符合門檻筆數", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
 
 # 顯示本輪掃描到的大單買入 toast
 show_pending_toasts()
@@ -1387,6 +1417,7 @@ card_html_parts.append('</div>')
 st.markdown("".join(card_html_parts), unsafe_allow_html=True)
 
 recent_large_orders.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
+st.caption(f"本輪以目前門檻 ≥ {int(st.session_state.large_order_threshold)} 張掃到的大單筆數：{len(recent_large_orders)} 筆")
 if recent_large_orders:
     st.markdown("#### 🔔 最近大單訊息")
     recent_cols = st.columns(min(3, len(recent_large_orders)))
@@ -1419,6 +1450,7 @@ for group_name, display_df in group_tables.items():
             "代碼": st.column_config.LinkColumn("代碼", help="點擊前往 Yahoo 台股個股頁", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
             "股票名稱": st.column_config.TextColumn("股票名稱"),
             "大單追蹤": st.column_config.TextColumn("大單追蹤", help="達到大單門檻時顯示最近一筆大單時間、張數、價格、內外盤與漲幅"),
+            "符合門檻筆數": st.column_config.NumberColumn("符合門檻筆數", help="最近 200 筆單筆成交中，符合目前大單門檻的筆數；門檻 5 時，5 張以上都會計入"),
             "即時價": st.column_config.TextColumn("即時價", help="由富邦 WebSocket trades 即時成交價取得"),
             "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1"),
             "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
