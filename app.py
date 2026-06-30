@@ -58,7 +58,6 @@ TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
 
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
-DEFAULT_LARGE_ORDER_THRESHOLD = 5  # 預設大單門檻；之後以 UI 即時值為準
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -660,12 +659,9 @@ class FubonRealtimeManager:
         with self.lock:
             return copy.deepcopy(self.messages.get(code))
 
-    def get_order_status(self, symbol: str, large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD):
+    def get_order_status(self, symbol: str, large_order_threshold: int = 50):
         code = symbol_to_code(symbol)
-        try:
-            threshold = max(1, int(large_order_threshold))
-        except Exception:
-            threshold = DEFAULT_LARGE_ORDER_THRESHOLD
+        threshold = int(large_order_threshold or 50)
         with self.lock:
             status = copy.deepcopy(self.tick_status.get(code, {
                 "last_ws_price": None,
@@ -690,31 +686,6 @@ class FubonRealtimeManager:
         else:
             status["large_order_text"] = "監控中"
         return status
-
-
-    def get_recent_large_orders(self, symbol: str, large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD, limit: int = 50):
-        """回傳最近符合目前大單門檻的所有成交，不只回傳最後一筆。"""
-        code = symbol_to_code(symbol)
-        try:
-            threshold = max(1, int(large_order_threshold))
-        except Exception:
-            threshold = DEFAULT_LARGE_ORDER_THRESHOLD
-        try:
-            limit = max(1, int(limit))
-        except Exception:
-            limit = 50
-        with self.lock:
-            status = copy.deepcopy(self.tick_status.get(code, {"recent_tick_orders": []}))
-        orders = []
-        for order in status.get("recent_tick_orders", []):
-            try:
-                volume = int(order.get("volume") or 0)
-            except Exception:
-                volume = 0
-            if volume >= threshold:
-                orders.append(order)
-        orders.sort(key=lambda x: x.get("time") or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
-        return orders[:limit]
 
     def get_status(self):
         with self.lock:
@@ -785,7 +756,7 @@ if "auto_refresh_enabled" not in st.session_state:
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 if "large_order_threshold" not in st.session_state:
-    st.session_state.large_order_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
+    st.session_state.large_order_threshold = 50
 if "telegram_pct_threshold" not in st.session_state:
     st.session_state.telegram_pct_threshold = 3.0
 if "stock_groups" not in st.session_state:
@@ -820,9 +791,6 @@ if "_large_order_toast_messages" not in st.session_state:
 
 def show_pending_toasts():
     """顯示右上角 toast。duration='long' 約為 10 秒。"""
-    if "_threshold_changed_message" in st.session_state:
-        st.toast(st.session_state._threshold_changed_message, icon="✅", duration="long")
-        del st.session_state._threshold_changed_message
     if "_quick_add_success_message" in st.session_state:
         st.toast(st.session_state._quick_add_success_message, duration="long")
         del st.session_state._quick_add_success_message
@@ -844,7 +812,7 @@ def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
     time_key = order_time.strftime("%Y%m%d%H%M%S") if hasattr(order_time, "strftime") else str(order_time)
     volume = int(latest.get("volume") or 0)
     price = latest.get("price")
-    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}_th{st.session_state.get('large_order_threshold', DEFAULT_LARGE_ORDER_THRESHOLD)}"
+    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}"
 
     # 同一筆大單只通知一次，避免自動刷新時重複跳出 toast / Telegram
     if toast_key in st.session_state.large_order_toast_keys:
@@ -893,17 +861,6 @@ def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
 
 # 顯示上一輪 rerun 留下的提示，例如快速新增股票成功
 show_pending_toasts()
-
-
-def on_large_order_threshold_change():
-    """大單門檻變更時立即同步，並清掉通知去重快取。"""
-    try:
-        new_threshold = max(1, int(st.session_state.get("large_order_threshold", DEFAULT_LARGE_ORDER_THRESHOLD)))
-    except Exception:
-        new_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
-    st.session_state.large_order_threshold = new_threshold
-    st.session_state.large_order_toast_keys = set()
-    st.session_state._threshold_changed_message = f"大單門檻已即時更新為 {new_threshold} 張，並重新掃描最近成交。"
 
 
 def enter_edit_mode():
@@ -1187,7 +1144,7 @@ with control_col3:
 with control_col4:
     st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
 with control_col5:
-    st.number_input("大單門檻（張）", min_value=1, step=1, key="large_order_threshold", on_change=on_large_order_threshold_change, help="調整後會立即用新門檻重新掃描最近 200 筆單筆成交。")
+    st.number_input("大單門檻（張）", min_value=1, step=10, key="large_order_threshold")
 with control_col6:
     st.number_input(
         "推送漲跌幅門檻 (%)",
@@ -1234,7 +1191,6 @@ if status["error"]:
     st.error(status["error"])
 
 st.info("即時價由富邦 WebSocket trades 抓取；最新單筆 = 富邦盤中累積成交量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
-st.caption(f"✅ 目前實際掃描大單門檻：單筆 ≥ {int(st.session_state.large_order_threshold)} 張")
 
 # ===== 先整理資料：同一份資料同時產生儀表板與表格 =====
 group_tables = {}
@@ -1256,7 +1212,6 @@ for group_name, stocks in st.session_state.stock_groups.items():
         code = symbol_to_code(symbol)
         stock_name = get_stock_name(symbol)
         order_status = manager.get_order_status(symbol, st.session_state.large_order_threshold) if manager is not None else {}
-        qualifying_orders = manager.get_recent_large_orders(symbol, st.session_state.large_order_threshold, limit=20) if manager is not None else []
         tick_vol = order_status.get("real_tick_volume")
         current_price = order_status.get("last_ws_price")
         yesterday_close, close_date, yf_source = get_yfinance_yesterday_close(symbol)
@@ -1281,29 +1236,23 @@ for group_name, stocks in st.session_state.stock_groups.items():
             if float(change_pct) >= float(pct_threshold):
                 pct_hit_count += 1
 
-        if qualifying_orders:
-            # 此檔只要最近 200 筆內有任一筆 >= 目前門檻，就算有大單；不再只看最後一筆。
+        if latest:
             large_order_count += 1
-            if any(o.get("type") == "外盤(買)" for o in qualifying_orders):
+            if latest.get("type") == "外盤(買)":
                 large_buy_count += 1
-            if any(o.get("type") == "內盤(賣)" for o in qualifying_orders):
+            elif latest.get("type") == "內盤(賣)":
                 large_sell_count += 1
+            msg = {"group": group_name, "code": code, "name": stock_name, "text": large_text, "time": latest.get("time"), "pct": change_pct, "type": latest.get("type", "-")}
+            group_large_messages.append(msg)
+            recent_large_orders.append(msg)
 
-            # 列出每一筆符合門檻的成交，避免 5 張被後面的 90 張覆蓋。
-            for order in qualifying_orders[:5]:
-                order_text = manager._format_large_order_text(order)
-                if change_pct is not None:
-                    order_text = f"{order_text}｜{format_pct_value(change_pct)}"
-                msg = {"group": group_name, "code": code, "name": stock_name, "text": order_text, "time": order.get("time"), "pct": change_pct, "type": order.get("type", "-")}
-                group_large_messages.append(msg)
-                recent_large_orders.append(msg)
-                queue_large_buy_toast(group_name, code, stock_name, order, change_pct)
+            # ✅ 右上角 toast + Telegram：監控到「外盤(買)」大單時通知
+            queue_large_buy_toast(group_name, code, stock_name, latest, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
             "大單追蹤": large_text,
-            "符合門檻筆數": len(qualifying_orders),
             "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
             "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
@@ -1337,7 +1286,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "top_pct_text": top_pct_text,
         "large_msg_text": large_msg_text,
     })
-    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "符合門檻筆數", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
+    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
 
 # 顯示本輪掃描到的大單買入 toast
 show_pending_toasts()
@@ -1356,9 +1305,9 @@ for item in dashboard_items:
         f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])} 明細表">'
         f'<div class="{card_class}">'
         f'<div class="dash-title">{escape_html(item["group"])}</div>'
-        f'<div class="dash-big">{item["large_order_count"]} / {item["total"]}</div>'
-        f'<div class="dash-line">🚀 外盤大單：<b>{item["large_buy_count"]}</b>　📉 內盤大單：<b>{item["large_sell_count"]}</b></div>'
+        f'<div class="dash-big">{item["pct_hit_count"]} / {item["total"]}</div>'
         f'<div class="dash-line">📈 漲幅達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
+        f'<div class="dash-line">🚀 外盤大單：<b>{item["large_buy_count"]}</b>　📉 內盤大單：<b>{item["large_sell_count"]}</b></div>'
         f'<div class="dash-small"><b>大單追蹤</b><br>{item["large_msg_text"]}</div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
         f'</div></a>'
@@ -1367,7 +1316,6 @@ card_html_parts.append('</div>')
 st.markdown("".join(card_html_parts), unsafe_allow_html=True)
 
 recent_large_orders.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
-st.caption(f"本輪以目前門檻 ≥ {int(st.session_state.large_order_threshold)} 張掃到的大單筆數：{len(recent_large_orders)} 筆")
 if recent_large_orders:
     st.markdown("#### 🔔 最近大單訊息")
     recent_cols = st.columns(min(3, len(recent_large_orders)))
