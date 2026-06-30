@@ -585,9 +585,9 @@ class FubonRealtimeManager:
                 "last_trade_type": "-",
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
-                "tick_volume_history": [],
-                "recent_tick_orders": [],
-                "current_avg_10_volume": None,
+                "tick_volume_history": [],       # 最近最多 10 筆單量，用來計算最新10筆均量
+                "recent_tick_orders": [],        # 最近單筆明細，顯示時依當前門檻動態判斷大單
+                "current_avg_10_volume": None,   # 表格直接顯示此值，不依賴是否判定為大單
                 "current_avg_multiple": None,
                 "latest_large_order": None,
             })
@@ -625,7 +625,7 @@ class FubonRealtimeManager:
                     status["total_sell_vol"] = int(status.get("total_sell_vol", 0) or 0) + tick_volume
 
                 # 不在 WebSocket callback 內用固定門檻過濾；UI 改門檻後可即時套用。
-                # 近10均量用「包含目前這筆」的最近最多10筆單量計算，確保表格能即時顯示均量。
+                # 最新10筆均量用「包含目前這筆」的最近最多10筆單量計算，因此表格會即時有數值。
                 history = [int(v) for v in status.get("tick_volume_history", []) if int(v) > 0]
                 history.append(int(tick_volume))
                 history = history[-10:]
@@ -641,6 +641,7 @@ class FubonRealtimeManager:
                     "avg_multiple": avg_multiple,
                     "sample_count": len(history),
                 }
+
                 recent_orders = status.get("recent_tick_orders", [])
                 recent_orders.append(tick_order)
                 status["recent_tick_orders"] = recent_orders[-200:]
@@ -676,7 +677,7 @@ class FubonRealtimeManager:
             return copy.deepcopy(self.messages.get(code))
 
     def _is_large_order(self, order, threshold: int):
-        # 大單判定：固定張數門檻，或單筆量 >= 最新單筆近10筆平均。
+        # 大單判定：固定張數門檻，或單筆量 >= 最新10筆均量。
         if not order:
             return False, "-"
         volume = int(order.get("volume") or 0)
@@ -708,14 +709,24 @@ class FubonRealtimeManager:
                 "latest_large_order": None,
             }))
 
-        # 若 current_avg_10_volume 尚未存在，從 tick_volume_history 補算，避免舊 session 顯示 -。
         history = [int(v) for v in status.get("tick_volume_history", []) if int(v) > 0]
-        if history and not status.get("current_avg_10_volume"):
+        # 兼容舊 session：若還沒有 history，但已經有最新單筆，就先以最新單筆作為均量，避免表格顯示 -。
+        if not history and status.get("real_tick_volume") is not None:
+            try:
+                latest_tick = int(status.get("real_tick_volume") or 0)
+                if latest_tick > 0:
+                    history = [latest_tick]
+            except Exception:
+                pass
+        if history:
             status["current_avg_10_volume"] = round(sum(history[-10:]) / len(history[-10:]), 2)
 
         latest_large = None
         large_reason = "-"
         for order in reversed(status.get("recent_tick_orders", [])):
+            # 若舊的 recent order 沒有 avg_10_volume，補上目前均量再判斷。
+            if not order.get("avg_10_volume") and status.get("current_avg_10_volume"):
+                order["avg_10_volume"] = status.get("current_avg_10_volume")
             is_large, reason = self._is_large_order(order, threshold)
             if is_large:
                 latest_large = order
@@ -728,7 +739,7 @@ class FubonRealtimeManager:
         if latest_large:
             avg_10 = latest_large.get("avg_10_volume") or status.get("current_avg_10_volume")
             multiple = latest_large.get("avg_multiple")
-            avg_text = f"｜近10均量 {avg_10:.1f}張" if avg_10 else ""
+            avg_text = f"｜最新10筆均量 {avg_10:.1f}張" if avg_10 else ""
             if multiple:
                 avg_text += f" / {multiple:.2f}倍"
             status["large_order_text"] = f"{self._format_large_order_text(latest_large)}｜{large_reason}{avg_text}"
@@ -880,7 +891,7 @@ def queue_large_order_toast(group_name, code, stock_name, latest, change_pct, te
     price_text = f"{float(price):.2f}" if isinstance(price, (int, float)) else "-"
     pct_text = format_pct_value(pct_value)
     icon = "🚀" if trade_type == "外盤(買)" else "📉" if trade_type == "內盤(賣)" else "🔔"
-    avg_text = f"｜近10均量：{float(avg_10):.1f} 張｜倍數：{float(multiple):.2f}x" if avg_10 and multiple else ""
+    avg_text = f"｜最新10筆均量：{float(avg_10):.1f} 張｜倍數：{float(multiple):.2f}x" if avg_10 and multiple else ""
 
     toast_msg = (
         f"{icon} 大單偵測\n"
