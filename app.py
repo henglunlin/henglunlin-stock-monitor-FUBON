@@ -58,6 +58,7 @@ TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
 
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
+DEFAULT_LARGE_ORDER_THRESHOLD = 5  # 預設大單門檻；之後以 UI 即時值為準
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -659,9 +660,12 @@ class FubonRealtimeManager:
         with self.lock:
             return copy.deepcopy(self.messages.get(code))
 
-    def get_order_status(self, symbol: str, large_order_threshold: int = 50):
+    def get_order_status(self, symbol: str, large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD):
         code = symbol_to_code(symbol)
-        threshold = int(large_order_threshold or 50)
+        try:
+            threshold = max(1, int(large_order_threshold))
+        except Exception:
+            threshold = DEFAULT_LARGE_ORDER_THRESHOLD
         with self.lock:
             status = copy.deepcopy(self.tick_status.get(code, {
                 "last_ws_price": None,
@@ -756,7 +760,7 @@ if "auto_refresh_enabled" not in st.session_state:
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 if "large_order_threshold" not in st.session_state:
-    st.session_state.large_order_threshold = 50
+    st.session_state.large_order_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
 if "telegram_pct_threshold" not in st.session_state:
     st.session_state.telegram_pct_threshold = 3.0
 if "stock_groups" not in st.session_state:
@@ -791,6 +795,9 @@ if "_large_order_toast_messages" not in st.session_state:
 
 def show_pending_toasts():
     """顯示右上角 toast。duration='long' 約為 10 秒。"""
+    if "_threshold_changed_message" in st.session_state:
+        st.toast(st.session_state._threshold_changed_message, icon="✅", duration="long")
+        del st.session_state._threshold_changed_message
     if "_quick_add_success_message" in st.session_state:
         st.toast(st.session_state._quick_add_success_message, duration="long")
         del st.session_state._quick_add_success_message
@@ -812,7 +819,7 @@ def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
     time_key = order_time.strftime("%Y%m%d%H%M%S") if hasattr(order_time, "strftime") else str(order_time)
     volume = int(latest.get("volume") or 0)
     price = latest.get("price")
-    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}"
+    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}_th{st.session_state.get('large_order_threshold', DEFAULT_LARGE_ORDER_THRESHOLD)}"
 
     # 同一筆大單只通知一次，避免自動刷新時重複跳出 toast / Telegram
     if toast_key in st.session_state.large_order_toast_keys:
@@ -861,6 +868,21 @@ def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
 
 # 顯示上一輪 rerun 留下的提示，例如快速新增股票成功
 show_pending_toasts()
+
+
+def on_large_order_threshold_change():
+    """大單門檻變更時立即同步 session_state，並清掉已通知去重快取。
+
+    降低門檻時，recent_tick_orders 內原本 5~49 張的成交會在本輪 rerun
+    以新門檻重新掃描；清掉去重快取可避免 UI / Telegram 繼續看起來像沿用舊 50 張。
+    """
+    try:
+        new_threshold = max(1, int(st.session_state.get("large_order_threshold", DEFAULT_LARGE_ORDER_THRESHOLD)))
+    except Exception:
+        new_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
+    st.session_state.large_order_threshold = new_threshold
+    st.session_state.large_order_toast_keys = set()
+    st.session_state._threshold_changed_message = f"大單門檻已即時更新為 {new_threshold} 張，並已用新門檻重新掃描近期成交。"
 
 
 def enter_edit_mode():
@@ -1144,7 +1166,7 @@ with control_col3:
 with control_col4:
     st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
 with control_col5:
-    st.number_input("大單門檻（張）", min_value=1, step=5, key="large_order_threshold")
+    st.number_input("大單門檻（張）", min_value=1, step=1, key="large_order_threshold", on_change=on_large_order_threshold_change, help="調整後會立即用新門檻重新掃描最近 200 筆單筆成交；不再沿用 50 張。")
 with control_col6:
     st.number_input(
         "推送漲跌幅門檻 (%)",
@@ -1191,6 +1213,7 @@ if status["error"]:
     st.error(status["error"])
 
 st.info("即時價由富邦 WebSocket trades 抓取；最新單筆 = 富邦盤中累積成交量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
+st.caption(f"✅ 目前實際掃描大單門檻：單筆 ≥ {int(st.session_state.large_order_threshold)} 張")
 
 # ===== 先整理資料：同一份資料同時產生儀表板與表格 =====
 group_tables = {}
