@@ -74,29 +74,67 @@ st.markdown(
     """
     <style>
     html { scroll-behavior: smooth; }
-    .dashboard-link, .dashboard-link:link, .dashboard-link:visited, .dashboard-link:hover, .dashboard-link:active { text-decoration:none !important; color:inherit !important; display:block; }
-    .dash-card { cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; }
-    .dash-card:hover { transform:translateY(-2px); box-shadow:0 4px 10px rgba(0,0,0,.12); }
-    .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
-    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:190px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04);}
-    /* 儀表板顏色依「漲幅達標比例」分級：0%、1~39%、40~69%、70%以上 */
-    .dash-card.pct-zero {border-color:#d9d9d9; background:#fafafa;}
-    .dash-card.pct-low {border-color:#91d5ff; background:#f0f9ff;}
-    .dash-card.pct-mid {border-color:#ffd666; background:#fffbe6;}
-    .dash-card.pct-high {border-color:#ff7875; background:#fff1f0; box-shadow:0 1px 8px rgba(207,19,34,.18);}
-    .dash-card.hot {border-color:#ff9c6e; background:#fff7e6;}
-    .dash-card.strong {border-color:#95de64; background:#f6ffed;}
-    .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
-    .dash-big {font-size:28px; font-weight:900; margin:4px 0 10px 0;}
-    .dash-line {font-size:14px; line-height:1.65; color:#111827;}
-    .dash-small {font-size:12px; color:#4b5563; margin-top:8px; border-top:1px solid rgba(0,0,0,.08); padding-top:8px;}
-    .up-text {color:#cf1322; font-weight:700;} .down-text {color:#389e0d; font-weight:700;} .flat-text {color:#6b7280; font-weight:700;}
-    @media (max-width:1200px){.dashboard-grid{grid-template-columns:repeat(2,minmax(240px,1fr));}}
-    @media (max-width:700px){.dashboard-grid{grid-template-columns:1fr;}}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+
+    .dashboard-link,
+    .dashboard-link:link,
+    .dashboard-link:visited,
+    .dashboard-link:hover,
+    .dashboard-link:active {
+        text-decoration: none !important;
+        color: inherit !important;
+        display: block;
+    }
+
+    .dash-card {
+        cursor:pointer;
+        transition:transform .12s ease, box-shadow .12s ease;
+    }
+
+    .dash-card:hover {
+        transform:translateY(-2px);
+        box-shadow:0 4px 10px rgba(0,0,0,.12);
+    }
+
+    .dashboard-grid {
+        display:grid;
+        grid-template-columns:repeat(4,minmax(240px,1fr));
+        gap:12px;
+        margin:10px 0 18px 0;
+    }
+
+    .dash-card {
+        border:1px solid #91d5ff;
+        border-radius:12px;
+        padding:14px 16px;
+        min-height:190px;
+        background:#f0f9ff;
+        box-shadow:0 1px 2px rgba(0,0,0,.04);
+        color:#111827;   /* ✅ 預設深字 */
+    }
+
+    /* ✅ 顏色分級 */
+    .dash-card.pct-zero {
+        border-color:#d9d9d9;
+        background:#fafafa;
+        color:#6b7280;
+    }
+
+    .dash-card.pct-low {
+        border-color:#91d5ff;
+        background:#f0f9ff;
+        color:#111827;
+    }
+
+    .dash-card.pct-mid {
+        border-color:#ffd666;
+        background:#fffbe6;
+        color:#7a4e00;
+    }
+
+    .dash-card.pct-high {
+        border-color:#ff7875;
+        background:#fff1f0;
+
 
 # =============================================================================
 # 基礎工具
