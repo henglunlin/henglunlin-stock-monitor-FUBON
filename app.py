@@ -586,7 +586,7 @@ class FubonRealtimeManager:
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
                 "tick_volume_history": [],       # 最近最多 10 筆單量，用來計算近10均量；僅供參考
-                "recent_tick_orders": [],        # 最近單筆明細，顯示時依目前固定門檻動態判斷大單
+                "recent_tick_orders": [],        # 最近單筆明細；顯示時依目前固定門檻動態判斷大單
                 "current_avg_10_volume": None,   # 表格直接顯示此值，不參與大單判定
                 "current_avg_multiple": None,
                 "latest_large_order": None,
@@ -844,22 +844,15 @@ def show_pending_toasts():
 
     messages = st.session_state.get("_large_order_toast_messages", [])
     if messages:
-        # 避免同一輪太多 toast 佔滿畫面，最多顯示最新 3 則
-        for msg in messages[-3:]:
+        # 避免同一輪太多 toast 佔滿畫面，最多顯示最新 10 則
+        for msg in messages[-10:]:
             st.toast(msg, icon="🚀", duration="long")
         st.session_state._large_order_toast_messages = []
 
 
 def queue_large_order_toast(group_name, code, stock_name, latest, change_pct, telegram_pct_threshold):
-    """固定門檻大單且漲跌幅達推送門檻時，加入 toast；Telegram 開啟時同步推送。"""
-    if not latest or change_pct is None:
-        return
-    try:
-        pct_value = float(change_pct)
-        pct_threshold = abs(float(telegram_pct_threshold))
-    except Exception:
-        return
-    if abs(pct_value) < pct_threshold:
+    """右上角 toast：只要固定門檻大單就提醒；Telegram：固定門檻大單且漲跌幅達門檻才推送。"""
+    if not latest:
         return
 
     order_time = latest.get("time")
@@ -868,15 +861,18 @@ def queue_large_order_toast(group_name, code, stock_name, latest, change_pct, te
     price = latest.get("price")
     trade_type = latest.get("type", "-")
     reason = latest.get("reason") or "固定門檻大單"
-    toast_key = f"{code}_{time_key}_{volume}_{trade_type}_{price}_{pct_threshold}"
+    toast_key = f"{code}_{time_key}_{volume}_{trade_type}_{price}"
+
+    # 同一筆大單只提醒一次，避免自動刷新時重複跳出 toast / Telegram。
     if toast_key in st.session_state.large_order_toast_keys:
         return
 
     time_text = order_time.strftime("%H:%M:%S") if hasattr(order_time, "strftime") else "--:--:--"
     price_text = f"{float(price):.2f}" if isinstance(price, (int, float)) else "-"
-    pct_text = format_pct_value(pct_value)
+    pct_text = format_pct_value(change_pct)
     icon = "🚀" if trade_type == "外盤(買)" else "📉" if trade_type == "內盤(賣)" else "🔔"
 
+    # ✅ 右上角 toast：只要有固定門檻大單就提醒，不再受 Telegram 開關與漲跌幅門檻影響。
     toast_msg = (
         f"{icon} 大單偵測\n"
         f"{group_name}｜{code} {stock_name}\n"
@@ -886,7 +882,16 @@ def queue_large_order_toast(group_name, code, stock_name, latest, change_pct, te
     )
     st.session_state._large_order_toast_messages.append(toast_msg)
 
-    if st.session_state.get("tg_push_enabled", False):
+    # ✅ Telegram：固定門檻大單 + 漲跌幅達 ±門檻 + Telegram 開關開啟才推送。
+    should_send_telegram = False
+    pct_threshold = abs(float(telegram_pct_threshold or 0))
+    try:
+        if change_pct is not None:
+            should_send_telegram = abs(float(change_pct)) >= pct_threshold
+    except Exception:
+        should_send_telegram = False
+
+    if st.session_state.get("tg_push_enabled", False) and should_send_telegram:
         yahoo_url = yahoo_quote_url(code)
         telegram_msg = (
             f"{icon} <b>大單偵測</b>\n"
@@ -966,6 +971,8 @@ def render_fubon_login():
         with c1:
             if st.button("盤中累積歸零", width="stretch"):
                 manager.reset_runtime_data()
+                st.session_state.large_order_toast_keys = set()
+                st.session_state._large_order_toast_messages = []
                 st.rerun()
         with c2:
             if st.button("登出", width="stretch"):
@@ -973,6 +980,11 @@ def render_fubon_login():
                 st.session_state.fubon_logged_in = False
                 st.session_state.pop("fubon_login_time", None)
                 st.rerun()
+        if st.button("清除大單提醒去重紀錄", width="stretch"):
+            st.session_state.large_order_toast_keys = set()
+            st.session_state._large_order_toast_messages = []
+            st.sidebar.success("已清除大單提醒去重紀錄")
+            st.rerun()
         return
 
     pfx_base64 = get_fubon_pfx_base64()
@@ -1182,7 +1194,7 @@ with control_col3:
     tg_push = st.toggle(
         "📲 Telegram 推送開關",
         value=st.session_state.tg_push_enabled,
-        help="開啟後，符合『漲跌幅達推送門檻 ±N% 且固定門檻大單』才會推播",
+        help="開啟後，符合『漲跌幅達推送門檻 ±N% 且固定門檻大單』才會推播；右上角 toast 不受此開關影響。",
     )
     if tg_push != st.session_state.tg_push_enabled:
         st.session_state.tg_push_enabled = tg_push
@@ -1293,7 +1305,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
             group_large_messages.append(msg)
             recent_large_orders.append(msg)
 
-            # ✅ Telegram / Toast 推送：漲幅 >= +N% 或 <= -N%，且同時有固定門檻大單才推送
+            # ✅ 右上角 toast：固定門檻大單即提醒；Telegram：再額外判斷漲跌幅門檻與 Telegram 開關。
             queue_large_order_toast(group_name, code, stock_name, latest, change_pct, st.session_state.telegram_pct_threshold)
 
         rows.append({
@@ -1343,7 +1355,7 @@ show_pending_toasts()
 # ===== 儀表板 =====
 st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
 st.markdown("### 📌 大單追蹤儀表板")
-st.caption(f"大單判定：只看固定門檻，單筆 ≥ {st.session_state.large_order_threshold} 張｜近10均量僅供參考｜Telegram 推送：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}% 且固定門檻大單｜儀表板漲幅門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
+st.caption(f"大單判定：只看固定門檻，單筆 ≥ {st.session_state.large_order_threshold} 張｜近10均量僅供參考｜右上角 toast：固定門檻大單即提醒｜Telegram：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}% 且固定門檻大單｜儀表板漲幅門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
 st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
 
 card_html_parts = ['<div class="dashboard-grid">']
