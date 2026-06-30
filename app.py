@@ -585,9 +585,9 @@ class FubonRealtimeManager:
                 "last_trade_type": "-",
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
-                "tick_volume_history": [],       # 最近最多 10 筆單量，用來計算最新10筆均量
-                "recent_tick_orders": [],        # 最近單筆明細，顯示時依當前門檻動態判斷大單
-                "current_avg_10_volume": None,   # 表格直接顯示此值，不依賴是否判定為大單
+                "tick_volume_history": [],       # 最近最多 10 筆單量，用來計算近10均量；僅供參考
+                "recent_tick_orders": [],        # 最近單筆明細，顯示時依目前固定門檻動態判斷大單
+                "current_avg_10_volume": None,   # 表格直接顯示此值，不參與大單判定
                 "current_avg_multiple": None,
                 "latest_large_order": None,
             })
@@ -624,8 +624,8 @@ class FubonRealtimeManager:
                 elif trade_type == "內盤(賣)":
                     status["total_sell_vol"] = int(status.get("total_sell_vol", 0) or 0) + tick_volume
 
-                # 不在 WebSocket callback 內用固定門檻過濾；UI 改門檻後可即時套用。
-                # 最新10筆均量用「包含目前這筆」的最近最多10筆單量計算，因此表格會即時有數值。
+                # 不在 WebSocket callback 內用門檻過濾；避免 UI 改門檻後仍只看到舊門檻的大單。
+                # 近10均量僅供表格參考，不參與大單判定。
                 history = [int(v) for v in status.get("tick_volume_history", []) if int(v) > 0]
                 history.append(int(tick_volume))
                 history = history[-10:]
@@ -641,14 +641,12 @@ class FubonRealtimeManager:
                     "avg_multiple": avg_multiple,
                     "sample_count": len(history),
                 }
-
                 recent_orders = status.get("recent_tick_orders", [])
                 recent_orders.append(tick_order)
                 status["recent_tick_orders"] = recent_orders[-200:]
                 status["tick_volume_history"] = history
                 status["current_avg_10_volume"] = avg_10
                 status["current_avg_multiple"] = avg_multiple
-                status["latest_large_order"] = tick_order
 
             self.tick_status[symbol] = status
 
@@ -677,19 +675,14 @@ class FubonRealtimeManager:
             return copy.deepcopy(self.messages.get(code))
 
     def _is_large_order(self, order, threshold: int):
-        # 大單判定：固定張數門檻，或單筆量 >= 最新10筆均量。
+        # 大單判定：只使用固定張數門檻；近10均量僅供參考，不參與大單判定。
         if not order:
             return False, "-"
         volume = int(order.get("volume") or 0)
         fixed_hit = volume >= int(threshold)
-        avg_10 = order.get("avg_10_volume")
-        avg_hit = bool(avg_10 and avg_10 > 0 and volume >= float(avg_10))
-        reasons = []
         if fixed_hit:
-            reasons.append(f"固定門檻≥{int(threshold)}張")
-        if avg_hit:
-            reasons.append("最新10筆均量")
-        return fixed_hit or avg_hit, " + ".join(reasons) if reasons else "-"
+            return True, f"固定門檻≥{int(threshold)}張"
+        return False, "-"
 
     def get_order_status(self, symbol: str, large_order_threshold: int = 50):
         code = symbol_to_code(symbol)
@@ -709,8 +702,8 @@ class FubonRealtimeManager:
                 "latest_large_order": None,
             }))
 
+        # 若舊 session 沒有 current_avg_10_volume，嘗試用 history 或最新單筆補算，避免近10均量顯示 -。
         history = [int(v) for v in status.get("tick_volume_history", []) if int(v) > 0]
-        # 兼容舊 session：若還沒有 history，但已經有最新單筆，就先以最新單筆作為均量，避免表格顯示 -。
         if not history and status.get("real_tick_volume") is not None:
             try:
                 latest_tick = int(status.get("real_tick_volume") or 0)
@@ -724,9 +717,6 @@ class FubonRealtimeManager:
         latest_large = None
         large_reason = "-"
         for order in reversed(status.get("recent_tick_orders", [])):
-            # 若舊的 recent order 沒有 avg_10_volume，補上目前均量再判斷。
-            if not order.get("avg_10_volume") and status.get("current_avg_10_volume"):
-                order["avg_10_volume"] = status.get("current_avg_10_volume")
             is_large, reason = self._is_large_order(order, threshold)
             if is_large:
                 latest_large = order
@@ -737,11 +727,8 @@ class FubonRealtimeManager:
         status["large_order_reason"] = large_reason
         status["is_large_order"] = latest_large is not None
         if latest_large:
-            avg_10 = latest_large.get("avg_10_volume") or status.get("current_avg_10_volume")
-            multiple = latest_large.get("avg_multiple")
-            avg_text = f"｜最新10筆均量 {avg_10:.1f}張" if avg_10 else ""
-            if multiple:
-                avg_text += f" / {multiple:.2f}倍"
+            avg_10 = status.get("current_avg_10_volume")
+            avg_text = f"｜近10均量 {avg_10:.1f}張（參考）" if avg_10 else ""
             status["large_order_text"] = f"{self._format_large_order_text(latest_large)}｜{large_reason}{avg_text}"
         else:
             status["large_order_text"] = "監控中"
@@ -864,7 +851,7 @@ def show_pending_toasts():
 
 
 def queue_large_order_toast(group_name, code, stock_name, latest, change_pct, telegram_pct_threshold):
-    """有大單且漲跌幅達推送門檻時，加入 toast；Telegram 開啟時同步推送。"""
+    """固定門檻大單且漲跌幅達推送門檻時，加入 toast；Telegram 開啟時同步推送。"""
     if not latest or change_pct is None:
         return
     try:
@@ -880,9 +867,7 @@ def queue_large_order_toast(group_name, code, stock_name, latest, change_pct, te
     volume = int(latest.get("volume") or 0)
     price = latest.get("price")
     trade_type = latest.get("type", "-")
-    avg_10 = latest.get("avg_10_volume")
-    multiple = latest.get("avg_multiple")
-    reason = latest.get("reason") or "大單"
+    reason = latest.get("reason") or "固定門檻大單"
     toast_key = f"{code}_{time_key}_{volume}_{trade_type}_{price}_{pct_threshold}"
     if toast_key in st.session_state.large_order_toast_keys:
         return
@@ -891,14 +876,13 @@ def queue_large_order_toast(group_name, code, stock_name, latest, change_pct, te
     price_text = f"{float(price):.2f}" if isinstance(price, (int, float)) else "-"
     pct_text = format_pct_value(pct_value)
     icon = "🚀" if trade_type == "外盤(買)" else "📉" if trade_type == "內盤(賣)" else "🔔"
-    avg_text = f"｜最新10筆均量：{float(avg_10):.1f} 張｜倍數：{float(multiple):.2f}x" if avg_10 and multiple else ""
 
     toast_msg = (
         f"{icon} 大單偵測\n"
         f"{group_name}｜{code} {stock_name}\n"
         f"單筆：{volume} 張｜價格：{price_text}\n"
         f"時間：{time_text}｜漲幅：{pct_text}\n"
-        f"判定：{reason}{avg_text}"
+        f"判定：{reason}"
     )
     st.session_state._large_order_toast_messages.append(toast_msg)
 
@@ -912,8 +896,8 @@ def queue_large_order_toast(group_name, code, stock_name, latest, change_pct, te
             f"價格：<b>{price_text}</b>\n"
             f"時間：{time_text}\n"
             f"漲幅：{pct_text}\n"
-            f"判定：{reason}{avg_text}\n"
-            f"推送條件：漲跌幅 ≥ ±{pct_threshold:.1f}% 且有大單"
+            f"判定：{reason}\n"
+            f"推送條件：漲跌幅 ≥ ±{pct_threshold:.1f}% 且固定門檻大單"
         )
         send_telegram_message(telegram_msg)
 
@@ -1198,7 +1182,7 @@ with control_col3:
     tg_push = st.toggle(
         "📲 Telegram 推送開關",
         value=st.session_state.tg_push_enabled,
-        help="開啟後，符合『漲跌幅達推送門檻 ±N% 且有大單』才會推播",
+        help="開啟後，符合『漲跌幅達推送門檻 ±N% 且固定門檻大單』才會推播",
     )
     if tg_push != st.session_state.tg_push_enabled:
         st.session_state.tg_push_enabled = tg_push
@@ -1214,7 +1198,7 @@ with control_col6:
         max_value=10.0,
         step=0.5,
         key="telegram_pct_threshold",
-        help="Telegram 推送條件：漲幅 >= +此數字 或 跌幅 <= -此數字，且同時有大單。預設 3%。",
+        help="Telegram 推送條件：漲幅 >= +此數字 或 跌幅 <= -此數字，且同時有固定門檻大單。預設 3%。",
     )
 with control_col7:
     pct_threshold = st.number_input("儀表板漲幅門檻 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5)
@@ -1299,7 +1283,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
                 pct_hit_count += 1
 
         if latest and order_status.get("is_large_order", False):
-            latest["reason"] = order_status.get("large_order_reason", "大單")
+            latest["reason"] = order_status.get("large_order_reason", "固定門檻大單")
             large_order_count += 1
             if latest.get("type") == "外盤(買)":
                 large_buy_count += 1
@@ -1309,7 +1293,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
             group_large_messages.append(msg)
             recent_large_orders.append(msg)
 
-            # ✅ Telegram / Toast 推送：漲幅 >= +N% 或 <= -N%，且同時有大單才推送
+            # ✅ Telegram / Toast 推送：漲幅 >= +N% 或 <= -N%，且同時有固定門檻大單才推送
             queue_large_order_toast(group_name, code, stock_name, latest, change_pct, st.session_state.telegram_pct_threshold)
 
         rows.append({
@@ -1359,7 +1343,7 @@ show_pending_toasts()
 # ===== 儀表板 =====
 st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
 st.markdown("### 📌 大單追蹤儀表板")
-st.caption(f"大單判定：單筆 ≥ {st.session_state.large_order_threshold} 張，或單筆 ≥ 最新10筆均量｜Telegram 推送：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}% 且有大單｜儀表板漲幅門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
+st.caption(f"大單判定：只看固定門檻，單筆 ≥ {st.session_state.large_order_threshold} 張｜近10均量僅供參考｜Telegram 推送：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}% 且固定門檻大單｜儀表板漲幅門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
 st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
 
 card_html_parts = ['<div class="dashboard-grid">']
@@ -1416,8 +1400,8 @@ for group_name, display_df in group_tables.items():
             "即時價": st.column_config.TextColumn("即時價", help="由富邦 WebSocket trades 即時成交價取得"),
             "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1"),
             "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
-            "近10均量": st.column_config.TextColumn("近10均量", help="此股票最近最多 10 筆單量平均；不足 10 筆時先用已收到筆數計算"),
-            "大單判定": st.column_config.TextColumn("大單判定", help="固定張數門檻，或最新10筆均量"),
+            "近10均量": st.column_config.TextColumn("近10均量", help="此股票最近最多 10 筆單量平均；僅供參考，不參與大單判定"),
+            "大單判定": st.column_config.TextColumn("大單判定", help="只使用固定張數門檻"),
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
             "內盤累積": st.column_config.NumberColumn("內盤累積"),
