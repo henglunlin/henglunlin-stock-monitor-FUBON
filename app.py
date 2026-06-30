@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+
+def yahoo_quote_url(symbol: str) -> str:
+    """產生 Yahoo 台股個股頁連結."""
+
+    code = symbol.split('.')[0]
+
+    return f"https://tw.stock.yahoo.com/quote/{code}"
+
 """
 盤中大單進出監控 - 純富邦 WebSocket 版
 
