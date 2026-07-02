@@ -58,7 +58,10 @@ TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
 
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
-DEFAULT_LARGE_ORDER_THRESHOLD = 5  # 預設大單門檻；之後以 UI 即時值為準
+DEFAULT_LARGE_ORDER_THRESHOLD = 5  # 單筆大單門檻；之後以 UI 即時值為準
+DEFAULT_MOMENTUM_CUMULATIVE_THRESHOLD = 20  # 拉抬訊號：視窗內外盤大單累積張數門檻
+DEFAULT_MOMENTUM_WINDOW_SEC = 10  # 拉抬訊號：觀察秒數
+DEFAULT_MOMENTUM_PRICE_PCT = 2.0  # 拉抬訊號：視窗內價格拉抬百分比
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -591,6 +594,21 @@ class FubonRealtimeManager:
         icon = "🚀" if trade_type == "外盤(買)" else "📉" if trade_type == "內盤(賣)" else "🔔"
         return f"{icon} {time_text} {volume}張 {price_text} {trade_type}"
 
+
+    def _format_momentum_signal_text(self, signal):
+        """格式化「累積大單 + 秒級拉抬」訊號。"""
+        if not signal or not signal.get("active"):
+            return "監控中"
+        signal_time = signal.get("time")
+        time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
+        current_price = signal.get("current_price")
+        price_text = f"@{current_price:.2f}" if isinstance(current_price, (int, float)) else ""
+        return (
+            f"🔥 {time_text} {int(signal.get('window_sec', 0))}秒內 "
+            f"外盤大單累積{int(signal.get('cumulative_volume', 0))}張 "
+            f"拉抬+{float(signal.get('price_change_pct', 0)):.2f}% {price_text}"
+        )
+
     def _on_message(self, message):
         msg = self._parse_message(message)
         now = datetime.now(TW_TZ)
@@ -614,11 +632,20 @@ class FubonRealtimeManager:
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
                 "recent_tick_orders": [],
+                "price_history": [],
                 "latest_large_order": None,
+                "latest_momentum_signal": None,
             })
 
             if price is not None:
                 status["last_ws_price"] = price
+                # 保存最近 5 分鐘價格軌跡，用來判斷「N 秒內瞬間拉抬 X%」。
+                price_history = status.get("price_history", [])
+                price_history.append({"time": now, "price": float(price)})
+                status["price_history"] = [
+                    p for p in price_history
+                    if hasattr(p.get("time"), "timestamp") and (now - p.get("time")).total_seconds() <= 300
+                ][-500:]
 
             # ===== 重點修正：累積量轉單筆量 =====
             # 富邦 trades 的 volume 常是「盤中累積成交量」。
@@ -708,7 +735,9 @@ class FubonRealtimeManager:
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
                 "recent_tick_orders": [],
+                "price_history": [],
                 "latest_large_order": None,
+                "latest_momentum_signal": None,
             }))
 
         latest_large_order = None
@@ -737,7 +766,7 @@ class FubonRealtimeManager:
         except Exception:
             limit = 50
         with self.lock:
-            status = copy.deepcopy(self.tick_status.get(code, {"recent_tick_orders": []}))
+            status = copy.deepcopy(self.tick_status.get(code, {"recent_tick_orders": [], "price_history": []}))
         orders = []
         for order in status.get("recent_tick_orders", []):
             try:
@@ -748,6 +777,109 @@ class FubonRealtimeManager:
                 orders.append(order)
         orders.sort(key=lambda x: x.get("time") or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
         return orders[:limit]
+
+    def get_momentum_signal(
+        self,
+        symbol: str,
+        large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD,
+        cumulative_threshold: int = DEFAULT_MOMENTUM_CUMULATIVE_THRESHOLD,
+        window_sec: int = DEFAULT_MOMENTUM_WINDOW_SEC,
+        price_pct_threshold: float = DEFAULT_MOMENTUM_PRICE_PCT,
+    ):
+        """判斷「連續外盤大單 + N 秒內價格拉抬」訊號。
+
+        邏輯：
+        1. 最近 window_sec 秒內，只計算「外盤(買)」且單筆 >= large_order_threshold 的成交。
+        2. 這些大單累積張數 >= cumulative_threshold。
+        3. 目前價格相對 window_sec 秒內最早價格，漲幅 >= price_pct_threshold。
+        """
+        code = symbol_to_code(symbol)
+        try:
+            single_threshold = max(1, int(large_order_threshold))
+        except Exception:
+            single_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
+        try:
+            cumulative_threshold = max(1, int(cumulative_threshold))
+        except Exception:
+            cumulative_threshold = DEFAULT_MOMENTUM_CUMULATIVE_THRESHOLD
+        try:
+            window_sec = max(1, int(window_sec))
+        except Exception:
+            window_sec = DEFAULT_MOMENTUM_WINDOW_SEC
+        try:
+            price_pct_threshold = max(0.0, float(price_pct_threshold))
+        except Exception:
+            price_pct_threshold = DEFAULT_MOMENTUM_PRICE_PCT
+
+        now = datetime.now(TW_TZ)
+        with self.lock:
+            status = copy.deepcopy(self.tick_status.get(code, {
+                "last_ws_price": None,
+                "recent_tick_orders": [],
+                "price_history": [],
+                "latest_momentum_signal": None,
+            }))
+
+        current_price = status.get("last_ws_price")
+        recent_orders = []
+        for order in status.get("recent_tick_orders", []):
+            order_time = order.get("time")
+            if not hasattr(order_time, "timestamp"):
+                continue
+            age_sec = (now - order_time).total_seconds()
+            try:
+                volume = int(order.get("volume") or 0)
+            except Exception:
+                volume = 0
+            if (
+                0 <= age_sec <= window_sec
+                and order.get("type") == "外盤(買)"
+                and volume >= single_threshold
+            ):
+                recent_orders.append(order)
+
+        cumulative_volume = sum(int(o.get("volume") or 0) for o in recent_orders)
+
+        price_points = []
+        for point in status.get("price_history", []):
+            point_time = point.get("time")
+            point_price = self._safe_float(point.get("price"))
+            if not hasattr(point_time, "timestamp") or point_price is None or point_price <= 0:
+                continue
+            age_sec = (now - point_time).total_seconds()
+            if 0 <= age_sec <= window_sec:
+                price_points.append(point)
+        price_points.sort(key=lambda x: x.get("time"))
+
+        start_price = self._safe_float(price_points[0].get("price")) if price_points else None
+        price_change_pct = None
+        if current_price is not None and start_price is not None and start_price > 0:
+            price_change_pct = (float(current_price) / float(start_price) - 1) * 100
+
+        active = (
+            cumulative_volume >= cumulative_threshold
+            and price_change_pct is not None
+            and price_change_pct >= price_pct_threshold
+        )
+        signal = {
+            "active": bool(active),
+            "time": now,
+            "window_sec": window_sec,
+            "single_threshold": single_threshold,
+            "cumulative_threshold": cumulative_threshold,
+            "cumulative_volume": int(cumulative_volume),
+            "large_order_count": len(recent_orders),
+            "price_pct_threshold": float(price_pct_threshold),
+            "price_change_pct": price_change_pct,
+            "start_price": start_price,
+            "current_price": current_price,
+            "orders": recent_orders,
+        }
+        signal["text"] = self._format_momentum_signal_text(signal)
+        if active:
+            with self.lock:
+                self.tick_status.setdefault(code, {})["latest_momentum_signal"] = signal
+        return signal
 
     def get_status(self):
         with self.lock:
@@ -819,6 +951,12 @@ if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 if "large_order_threshold" not in st.session_state:
     st.session_state.large_order_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
+if "momentum_cumulative_threshold" not in st.session_state:
+    st.session_state.momentum_cumulative_threshold = DEFAULT_MOMENTUM_CUMULATIVE_THRESHOLD
+if "momentum_window_sec" not in st.session_state:
+    st.session_state.momentum_window_sec = DEFAULT_MOMENTUM_WINDOW_SEC
+if "momentum_price_pct" not in st.session_state:
+    st.session_state.momentum_price_pct = DEFAULT_MOMENTUM_PRICE_PCT
 if "telegram_pct_threshold" not in st.session_state:
     st.session_state.telegram_pct_threshold = 3.0
 if "stock_groups" not in st.session_state:
@@ -928,6 +1066,55 @@ def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
 show_pending_toasts()
 
 
+def queue_momentum_toast(group_name, code, stock_name, signal, change_pct):
+    """偵測到「累積外盤大單 + 秒級拉抬」時，加入 toast 佇列；若 Telegram 開啟則同步推送。"""
+    if not signal or not signal.get("active"):
+        return
+    signal_time = signal.get("time")
+    time_key = signal_time.strftime("%Y%m%d%H%M%S") if hasattr(signal_time, "strftime") else str(signal_time)
+    cumulative_volume = int(signal.get("cumulative_volume") or 0)
+    price_change_pct = float(signal.get("price_change_pct") or 0)
+    current_price = signal.get("current_price")
+    toast_key = (
+        f"MOM_{code}_{time_key}_{cumulative_volume}_"
+        f"{price_change_pct:.2f}_{current_price}_"
+        f"w{signal.get('window_sec')}_cum{signal.get('cumulative_threshold')}_pct{signal.get('price_pct_threshold')}"
+    )
+    if toast_key in st.session_state.large_order_toast_keys:
+        return
+
+    time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
+    price_text = f"{float(current_price):.2f}" if isinstance(current_price, (int, float)) else "-"
+    toast_msg = (
+        f"🔥 秒級拉抬訊號\n"
+        f"{group_name}｜{code} {stock_name}\n"
+        f"{int(signal.get('window_sec', 0))}秒內外盤大單累積：{cumulative_volume} 張\n"
+        f"價格拉抬：+{price_change_pct:.2f}%｜現價：{price_text}\n"
+        f"時間：{time_text}｜大單筆數：{int(signal.get('large_order_count', 0))}"
+    )
+    st.session_state._large_order_toast_messages.append(toast_msg)
+
+    if st.session_state.get("tg_push_enabled", False):
+        yahoo_url = yahoo_quote_url(code)
+        telegram_msg = (
+            f"🔥 <b>秒級拉抬訊號</b>\n"
+            f"分類：{group_name}\n"
+            f"股票：<a href=\"{yahoo_url}\">{code} {stock_name}</a>\n"
+            f"{int(signal.get('window_sec', 0))}秒內外盤大單累積：<b>{cumulative_volume}</b> 張\n"
+            f"價格拉抬：<b>+{price_change_pct:.2f}%</b>\n"
+            f"現價：<b>{price_text}</b>\n"
+            f"時間：{time_text}\n"
+            f"條件：單筆 ≥ {int(signal.get('single_threshold', 0))} 張；"
+            f"累積 ≥ {int(signal.get('cumulative_threshold', 0))} 張；"
+            f"拉抬 ≥ {float(signal.get('price_pct_threshold', 0)):.1f}%"
+        )
+        send_telegram_message(telegram_msg)
+
+    st.session_state.large_order_toast_keys.add(toast_key)
+    if len(st.session_state.large_order_toast_keys) > 500:
+        st.session_state.large_order_toast_keys = set(list(st.session_state.large_order_toast_keys)[-300:])
+
+
 def on_large_order_threshold_change():
     """大單門檻變更時立即同步，並清掉通知去重快取。"""
     try:
@@ -938,6 +1125,16 @@ def on_large_order_threshold_change():
     st.session_state.large_order_toast_keys = set()
     st.session_state._threshold_changed_message = f"大單門檻已即時更新為 {new_threshold} 張，並重新掃描最近成交。"
 
+
+
+def on_momentum_params_change():
+    """拉抬訊號參數變更時清掉通知去重快取。"""
+    st.session_state.large_order_toast_keys = set()
+    st.session_state._threshold_changed_message = (
+        f"拉抬訊號條件已更新：{int(st.session_state.momentum_window_sec)}秒內，"
+        f"外盤大單累積 ≥ {int(st.session_state.momentum_cumulative_threshold)} 張，"
+        f"價格拉抬 ≥ {float(st.session_state.momentum_price_pct):.1f}%"
+    )
 
 def enter_edit_mode():
     st.session_state.editing_mode = True
@@ -1202,7 +1399,7 @@ if os.path.exists(APP_LOGO):
 else:
     st.markdown("## ⚡ 盤中大單進出監控")
 
-control_col1, control_col2, control_col3, control_col4, control_col5, control_col6, control_col7 = st.columns([1, 1, 1, 1, 1, 1, 1])
+control_col1, control_col2, control_col3, control_col4, control_col5, control_col6, control_col7, control_col8, control_col9, control_col10 = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
 with control_col1:
     if st.button("🔄 手動刷新畫面", width="stretch"):
         st.rerun()
@@ -1232,6 +1429,12 @@ with control_col6:
     )
 with control_col7:
     pct_threshold = st.number_input("漲幅門檻 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5)
+with control_col8:
+    st.number_input("累積大單門檻（張）", min_value=1, step=1, key="momentum_cumulative_threshold", on_change=on_momentum_params_change, help="秒級拉抬訊號：觀察秒數內，外盤買進且單筆達大單門檻的成交累積需超過/達到此張數。")
+with control_col9:
+    st.number_input("拉抬秒數", min_value=1, max_value=60, step=1, key="momentum_window_sec", on_change=on_momentum_params_change, help="秒級拉抬訊號的觀察視窗，預設 10 秒。")
+with control_col10:
+    st.number_input("拉抬門檻 (%)", min_value=0.0, max_value=10.0, step=0.5, key="momentum_price_pct", on_change=on_momentum_params_change, help="秒級拉抬訊號：觀察秒數內價格需上漲達此百分比，預設 2%。")
 
 render_fubon_login()
 render_group_editor_lock()
@@ -1267,7 +1470,11 @@ if status["error"]:
     st.error(status["error"])
 
 st.info("即時價由富邦 WebSocket trades 抓取；最新單筆優先使用富邦 trades 的 size 單筆成交量；若無 size 才用累積量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
-st.caption(f"✅ 目前實際掃描大單門檻：單筆 ≥ {int(st.session_state.large_order_threshold)} 張")
+st.caption(
+    f"✅ 目前實際掃描條件：單筆大單 ≥ {int(st.session_state.large_order_threshold)} 張｜"
+    f"秒級拉抬：{int(st.session_state.momentum_window_sec)}秒內外盤大單累積 ≥ {int(st.session_state.momentum_cumulative_threshold)} 張，"
+    f"且價格拉抬 ≥ {float(st.session_state.momentum_price_pct):.1f}%"
+)
 
 # ===== 先整理資料：同一份資料同時產生儀表板與表格 =====
 group_tables = {}
@@ -1291,6 +1498,13 @@ for group_name, stocks in st.session_state.stock_groups.items():
         code = symbol_to_code(symbol)
         stock_name = get_stock_name(symbol)
         order_status = manager.get_order_status(symbol, st.session_state.large_order_threshold) if manager is not None else {}
+        momentum_signal = manager.get_momentum_signal(
+            symbol,
+            large_order_threshold=st.session_state.large_order_threshold,
+            cumulative_threshold=st.session_state.momentum_cumulative_threshold,
+            window_sec=st.session_state.momentum_window_sec,
+            price_pct_threshold=st.session_state.momentum_price_pct,
+        ) if manager is not None else {"active": False, "text": "監控中"}
         qualifying_orders = manager.get_recent_large_orders(symbol, st.session_state.large_order_threshold, limit=20) if manager is not None else []
         tick_vol = order_status.get("real_tick_volume")
         current_price = order_status.get("last_ws_price")
@@ -1309,6 +1523,20 @@ for group_name, stocks in st.session_state.stock_groups.items():
             large_text = f"{large_text}｜{format_pct_value(change_pct)}"
         latest = order_status.get("latest_large_order")
         trade_type = order_status.get("last_trade_type", "-")
+        momentum_text = momentum_signal.get("text", "監控中")
+        if momentum_signal.get("active"):
+            signal_msg = {
+                "group": group_name,
+                "code": code,
+                "name": stock_name,
+                "text": momentum_text,
+                "time": momentum_signal.get("time"),
+                "pct": change_pct,
+                "type": "秒級拉抬",
+            }
+            group_large_messages.append(signal_msg)
+            recent_large_orders.append(signal_msg)
+            queue_momentum_toast(group_name, code, stock_name, momentum_signal, change_pct)
 
         if change_pct is not None:
             known_pct_count += 1
@@ -1339,6 +1567,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
             "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
             "大單追蹤": large_text,
+            "秒級拉抬": momentum_text,
             "符合門檻筆數": len(qualifying_orders),
             "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
@@ -1377,7 +1606,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "top_pct_text": top_pct_text,
         "large_msg_text": large_msg_text,
     })
-    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "符合門檻筆數", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
+    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "秒級拉抬", "符合門檻筆數", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
 
 # 顯示本輪掃描到的大單買入 toast
 show_pending_toasts()
@@ -1385,7 +1614,12 @@ show_pending_toasts()
 # ===== 儀表板 =====
 st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
 st.markdown("### 📌 大單追蹤儀表板")
-st.caption(f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜漲幅達標門檻：≥ {pct_threshold:.1f}%｜Telegram 推送門檻：漲跌幅 ≥ ±{st.session_state.telegram_pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘")
+st.caption(
+    f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜"
+    f"秒級拉抬：{st.session_state.momentum_window_sec}秒內外盤大單累積 ≥ {st.session_state.momentum_cumulative_threshold} 張，"
+    f"拉抬 ≥ {float(st.session_state.momentum_price_pct):.1f}%｜"
+    f"漲幅達標門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘"
+)
 st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
 
 card_html_parts = ['<div class="dashboard-grid">']
