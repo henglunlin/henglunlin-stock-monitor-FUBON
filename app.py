@@ -2,20 +2,18 @@
 """
 盤中即時成交監控 - 純富邦 WebSocket 版
 
-重點：
-1. 富邦 WebSocket 負責盤中即時價、單筆量、內外盤。
-2. yfinance 只用來抓「昨日收盤價」，一小時更新一次，並存入本地 JSON 歷史快取。
-3. 表格顯示：代碼 Yahoo 連結｜股票名稱｜量價訊號｜即時價｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
-4. 已重新定義訊號條件：
-   條件1：
-     用 30 秒為單位紀錄成交量。
-     當目前 30 秒成交量 > 上一個 30 秒成交量 × 1.3，
-     且目前 30 秒內股價拉抬 >= 2% 或下跌 <= -2% 時，發出訊號。
-   條件2：
-     用 30 秒為單位紀錄成交量。
-     當目前 30 秒成交量 > 上一個 30 秒成交量 × 1.3，
-     並追蹤最近 1 分鐘低點 / 高點，
-     當股價自 1 分鐘低點拉抬 >= 2%，或自 1 分鐘高點下跌 >= 2% 時，發出訊號。
+目標：
+捕捉股價瞬間拉抬時的進場訊號。
+
+核心邏輯：
+1. 富邦 WebSocket 負責即時成交價、單筆量、內外盤。
+2. yfinance 只抓昨日收盤價，一小時更新一次，存入本地 JSON 快取。
+3. 使用「預估 30 秒成交量」提早判斷量能放大，不等完整 30 秒結束。
+4. 使用 5 秒 / 10 秒 / 30 秒漲幅捕捉瞬間拉抬。
+5. 使用外盤占比確認主動買盤。
+6. 使用最近 60 秒高低點追蹤，判斷突破高點或從低點急拉。
+7. 分成「預警」與「進場訊號」。
+8. 修正儀表板 HTML anchor UI 問題。
 """
 
 import os
@@ -43,9 +41,13 @@ except Exception:
     yf = None
 
 
-st.set_page_config(page_title="盤中即時成交監控", layout="wide")
+# =============================================================================
+# App Config
+# =============================================================================
+st.set_page_config(page_title="盤中瞬間拉抬進場監控", layout="wide")
 
 TW_TZ = ZoneInfo("Asia/Taipei")
+
 GROUP_EDIT_PIN = "1219"
 GROUPS_FILE = "stock_groups.json"
 BACKUP_DIR = "backups"
@@ -55,10 +57,16 @@ APP_LOGO = "jerry.jpg"
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
 
-DEFAULT_SIGNAL_WINDOW_SEC = 30
-DEFAULT_SIGNAL_TRACK_SEC = 60
-DEFAULT_SIGNAL_VOLUME_RATIO = 1.3
-DEFAULT_SIGNAL_PRICE_MOVE_PCT = 2.0
+# 進場訊號預設參數
+DEFAULT_ENTRY_BUCKET_SEC = 30
+DEFAULT_ENTRY_TRACK_SEC = 60
+DEFAULT_ENTRY_VOLUME_RATIO = 1.3
+DEFAULT_ENTRY_PRICE_MOVE_PCT = 2.0
+DEFAULT_EARLY_5S_PCT = 0.8
+DEFAULT_EARLY_10S_PCT = 1.2
+DEFAULT_BUY_PRESSURE_RATIO = 0.55
+DEFAULT_SIGNAL_COOLDOWN_SEC = 45
+DEFAULT_MIN_CURRENT_VOLUME = 20
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -72,10 +80,20 @@ DEFAULT_STOCK_GROUPS = {
 }
 
 
+# =============================================================================
+# CSS
+# =============================================================================
 st.markdown(
     """
     <style>
     html { scroll-behavior: smooth; }
+
+    .dashboard-grid {
+        display:grid;
+        grid-template-columns:repeat(4,minmax(260px,1fr));
+        gap:14px;
+        margin:14px 0 22px 0;
+    }
 
     .dashboard-link,
     .dashboard-link:link,
@@ -84,23 +102,16 @@ st.markdown(
     .dashboard-link:active {
         text-decoration:none !important;
         color:inherit !important;
-        display:block;
-    }
-
-    .dashboard-grid {
-        display:grid;
-        grid-template-columns:repeat(4,minmax(240px,1fr));
-        gap:12px;
-        margin:10px 0 18px 0;
+        display:block !important;
     }
 
     .dash-card {
         border:1px solid #91d5ff;
-        border-radius:12px;
-        padding:14px 16px;
-        min-height:180px;
+        border-radius:14px;
+        padding:16px 18px;
+        min-height:210px;
         background:#f0f9ff;
-        box-shadow:0 1px 2px rgba(0,0,0,.04);
+        box-shadow:0 1px 3px rgba(0,0,0,.08);
         color:#111827;
         cursor:pointer;
         transition:transform .12s ease, box-shadow .12s ease;
@@ -108,36 +119,32 @@ st.markdown(
 
     .dash-card:hover {
         transform:translateY(-2px);
-        box-shadow:0 4px 10px rgba(0,0,0,.18);
+        box-shadow:0 6px 16px rgba(0,0,0,.18);
     }
 
-    .dash-card.pct-zero {
-        border-color:#d9d9d9;
-        background:#fafafa;
-        color:#374151;
-    }
-
-    .dash-card.pct-low {
+    .dash-card.normal {
         border-color:#91d5ff;
         background:#f0f9ff;
-        color:#111827;
     }
 
-    .dash-card.pct-mid {
+    .dash-card.warn {
         border-color:#ffd666;
         background:#fffbe6;
-        color:#111827;
     }
 
-    .dash-card.pct-high {
-        border-color:#ff7875;
+    .dash-card.entry {
+        border-color:#ff4d4f;
         background:#fff1f0;
-        color:#111827;
-        box-shadow:0 1px 8px rgba(207,19,34,.18);
+        box-shadow:0 1px 10px rgba(207,19,34,.20);
+    }
+
+    .dash-card.idle {
+        border-color:#d9d9d9;
+        background:#fafafa;
     }
 
     .dash-title {
-        font-weight:800;
+        font-weight:900;
         font-size:18px;
         margin-bottom:8px;
         color:#111827;
@@ -145,19 +152,10 @@ st.markdown(
 
     .dash-big {
         font-size:30px;
-        font-weight:900;
+        font-weight:950;
         margin:4px 0 10px 0;
         color:#111827 !important;
-        text-shadow:none;
         letter-spacing:.3px;
-    }
-
-    .dash-card.pct-zero .dash-big { color:#374151 !important; }
-    .dash-card.pct-low .dash-big { color:#0f172a !important; }
-    .dash-card.pct-mid .dash-big { color:#7a4e00 !important; }
-    .dash-card.pct-high .dash-big {
-        color:#b91c1c !important;
-        text-shadow:0 1px 1px rgba(255,255,255,.65);
     }
 
     .dash-line {
@@ -169,33 +167,49 @@ st.markdown(
     .dash-small {
         font-size:12px;
         color:#374151;
-        margin-top:8px;
-        border-top:1px solid rgba(0,0,0,.10);
+        margin-top:9px;
+        border-top:1px solid rgba(0,0,0,.12);
         padding-top:8px;
+        line-height:1.55;
     }
 
     .up-text {
         color:#cf1322;
-        font-weight:700;
+        font-weight:800;
     }
 
     .down-text {
         color:#389e0d;
-        font-weight:700;
+        font-weight:800;
     }
 
     .flat-text {
         color:#6b7280;
-        font-weight:700;
+        font-weight:800;
     }
 
-    @media (max-width:1200px) {
+    .return-link-wrap {
+        text-align:right;
+        padding-top:0.6rem;
+    }
+
+    .return-link-wrap a {
+        color:#1677ff;
+        font-weight:700;
+        text-decoration:none;
+    }
+
+    .return-link-wrap a:hover {
+        text-decoration:underline;
+    }
+
+    @media (max-width:1400px) {
         .dashboard-grid {
-            grid-template-columns:repeat(2,minmax(240px,1fr));
+            grid-template-columns:repeat(2,minmax(260px,1fr));
         }
     }
 
-    @media (max-width:700px) {
+    @media (max-width:760px) {
         .dashboard-grid {
             grid-template-columns:1fr;
         }
@@ -209,13 +223,6 @@ st.markdown(
 # =============================================================================
 # 基礎工具
 # =============================================================================
-def get_secret_or_default(key: str, default: str = ""):
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
-
-
 def symbol_to_code(symbol: str) -> str:
     return str(symbol).strip().upper().split(".")[0]
 
@@ -228,6 +235,16 @@ def yahoo_quote_url(symbol: str) -> str:
 def make_anchor_id(group_name: str) -> str:
     anchor = re.sub(r"[^0-9A-Za-z一-鿿]+", "-", str(group_name)).strip("-")
     return f"group-{anchor or 'default'}"
+
+
+def escape_html(text_value):
+    return (
+        str(text_value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def format_price_value(value):
@@ -274,6 +291,15 @@ def format_ratio_value(value):
         return "-"
 
 
+def format_percent_ratio(value):
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value) * 100:.0f}%"
+    except Exception:
+        return "-"
+
+
 def pct_class(value):
     if value is None:
         return "flat-text"
@@ -286,16 +312,6 @@ def pct_class(value):
     if pct < 0:
         return "down-text"
     return "flat-text"
-
-
-def escape_html(text_value):
-    return (
-        str(text_value)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
 
 
 def normalize_symbol_quick(input_text: str):
@@ -361,6 +377,9 @@ def build_yfinance_candidates(symbol: str):
     return result
 
 
+# =============================================================================
+# yfinance 昨收快取
+# =============================================================================
 def load_yf_close_cache():
     if not os.path.exists(YF_CLOSE_CACHE_FILE):
         return {}
@@ -453,7 +472,6 @@ def get_yfinance_yesterday_close(symbol: str):
             }
 
             save_yf_close_cache(cache)
-
             return close_value, close_date, "yfinance"
 
         except Exception as e:
@@ -706,15 +724,12 @@ class FubonRealtimeManager:
 
     def _safe_int(self, value):
         val = self._safe_float(value)
-
         if val is None:
             return None
-
         return int(round(val))
 
     def _extract_symbol(self, msg):
         data = msg.get("data", {})
-
         if not isinstance(data, dict):
             data = {}
 
@@ -729,7 +744,6 @@ class FubonRealtimeManager:
 
     def _extract_price(self, msg):
         data = msg.get("data", {})
-
         if not isinstance(data, dict):
             data = {}
 
@@ -755,7 +769,6 @@ class FubonRealtimeManager:
 
     def _extract_cumulative_volume(self, msg):
         data = msg.get("data", {})
-
         if not isinstance(data, dict):
             data = {}
 
@@ -785,7 +798,6 @@ class FubonRealtimeManager:
 
     def _extract_tick_size(self, msg):
         data = msg.get("data", {})
-
         if not isinstance(data, dict):
             data = {}
 
@@ -811,7 +823,6 @@ class FubonRealtimeManager:
 
     def _extract_trade_type(self, msg, price=None):
         data = msg.get("data", {})
-
         if not isinstance(data, dict):
             data = {}
 
@@ -866,6 +877,25 @@ class FubonRealtimeManager:
 
         return "-"
 
+    def _default_status(self):
+        return {
+            "last_ws_price": None,
+            "last_cumulative_volume": None,
+            "real_tick_volume": None,
+            "last_trade_type": "-",
+            "total_buy_vol": 0,
+            "total_sell_vol": 0,
+            "recent_ticks": [],
+            "price_points": [],
+            "entry_state": {
+                "armed": False,
+                "armed_at": None,
+                "armed_low": None,
+                "armed_high": None,
+                "last_signal_at": None,
+            },
+        }
+
     def _on_message(self, message):
         msg = self._parse_message(message)
         now = datetime.now(TW_TZ)
@@ -887,16 +917,10 @@ class FubonRealtimeManager:
                 "raw": msg,
             }
 
-            status = self.tick_status.get(symbol, {
-                "last_ws_price": None,
-                "last_cumulative_volume": None,
-                "real_tick_volume": None,
-                "last_trade_type": "-",
-                "total_buy_vol": 0,
-                "total_sell_vol": 0,
-                "recent_ticks": [],
-                "price_points": [],
-            })
+            status = self.tick_status.get(symbol, self._default_status())
+
+            if "entry_state" not in status:
+                status["entry_state"] = self._default_status()["entry_state"]
 
             if price is not None:
                 status["last_ws_price"] = price
@@ -906,11 +930,12 @@ class FubonRealtimeManager:
                     "time": now,
                     "price": float(price),
                 })
+
                 status["price_points"] = [
                     p for p in price_points
                     if hasattr(p.get("time"), "timestamp")
                     and (now - p.get("time")).total_seconds() <= 300
-                ][-1000:]
+                ][-1500:]
 
             tick_volume = None
 
@@ -957,11 +982,12 @@ class FubonRealtimeManager:
 
                 recent_ticks = status.get("recent_ticks", [])
                 recent_ticks.append(tick)
+
                 status["recent_ticks"] = [
                     t for t in recent_ticks
                     if hasattr(t.get("time"), "timestamp")
                     and (now - t.get("time")).total_seconds() <= 300
-                ][-1000:]
+                ][-1500:]
 
             self.tick_status[symbol] = status
 
@@ -1002,236 +1028,328 @@ class FubonRealtimeManager:
         code = symbol_to_code(symbol)
 
         with self.lock:
-            return copy.deepcopy(self.tick_status.get(code, {
-                "last_ws_price": None,
-                "last_cumulative_volume": None,
-                "real_tick_volume": None,
-                "last_trade_type": "-",
-                "total_buy_vol": 0,
-                "total_sell_vol": 0,
-                "recent_ticks": [],
-                "price_points": [],
-            }))
+            return copy.deepcopy(self.tick_status.get(code, self._default_status()))
 
-    def get_volume_price_signal(
+    def _sum_tick_volume(self, ticks, start_ts, end_ts, trade_type=None):
+        total = 0
+
+        for tick in ticks:
+            tick_time = tick.get("time")
+
+            if not hasattr(tick_time, "timestamp"):
+                continue
+
+            ts = tick_time.timestamp()
+
+            if start_ts <= ts < end_ts:
+                if trade_type is None or tick.get("type") == trade_type:
+                    try:
+                        total += int(tick.get("volume") or 0)
+                    except Exception:
+                        pass
+
+        return total
+
+    def _price_at_or_after(self, price_points, start_ts):
+        candidates = []
+
+        for point in price_points:
+            point_time = point.get("time")
+            price = self._safe_float(point.get("price"))
+
+            if not hasattr(point_time, "timestamp") or price is None or price <= 0:
+                continue
+
+            if point_time.timestamp() >= start_ts:
+                candidates.append(point)
+
+        candidates.sort(key=lambda x: x.get("time"))
+
+        if not candidates:
+            return None
+
+        return self._safe_float(candidates[0].get("price"))
+
+    def _price_change_from_seconds(self, price_points, current_price, seconds):
+        if current_price is None:
+            return None
+
+        now = datetime.now(TW_TZ)
+        start_ts = now.timestamp() - seconds
+        base_price = self._price_at_or_after(price_points, start_ts)
+
+        if base_price is None or base_price <= 0:
+            return None
+
+        return (float(current_price) / float(base_price) - 1) * 100
+
+    def get_entry_signal(
         self,
         symbol: str,
-        window_sec: int = DEFAULT_SIGNAL_WINDOW_SEC,
-        track_sec: int = DEFAULT_SIGNAL_TRACK_SEC,
-        volume_ratio_threshold: float = DEFAULT_SIGNAL_VOLUME_RATIO,
-        price_move_pct: float = DEFAULT_SIGNAL_PRICE_MOVE_PCT,
+        bucket_sec: int = DEFAULT_ENTRY_BUCKET_SEC,
+        track_sec: int = DEFAULT_ENTRY_TRACK_SEC,
+        volume_ratio_threshold: float = DEFAULT_ENTRY_VOLUME_RATIO,
+        price_move_pct: float = DEFAULT_ENTRY_PRICE_MOVE_PCT,
+        early_5s_pct: float = DEFAULT_EARLY_5S_PCT,
+        early_10s_pct: float = DEFAULT_EARLY_10S_PCT,
+        buy_pressure_ratio_threshold: float = DEFAULT_BUY_PRESSURE_RATIO,
+        cooldown_sec: int = DEFAULT_SIGNAL_COOLDOWN_SEC,
+        min_current_volume: int = DEFAULT_MIN_CURRENT_VOLUME,
     ):
         code = symbol_to_code(symbol)
+        now = datetime.now(TW_TZ)
+        now_ts = now.timestamp()
 
         try:
-            window_sec = max(5, int(window_sec))
+            bucket_sec = max(5, int(bucket_sec))
         except Exception:
-            window_sec = DEFAULT_SIGNAL_WINDOW_SEC
+            bucket_sec = DEFAULT_ENTRY_BUCKET_SEC
 
         try:
-            track_sec = max(window_sec, int(track_sec))
+            track_sec = max(bucket_sec, int(track_sec))
         except Exception:
-            track_sec = DEFAULT_SIGNAL_TRACK_SEC
+            track_sec = DEFAULT_ENTRY_TRACK_SEC
 
         try:
             volume_ratio_threshold = max(0.1, float(volume_ratio_threshold))
         except Exception:
-            volume_ratio_threshold = DEFAULT_SIGNAL_VOLUME_RATIO
+            volume_ratio_threshold = DEFAULT_ENTRY_VOLUME_RATIO
 
         try:
             price_move_pct = max(0.1, float(price_move_pct))
         except Exception:
-            price_move_pct = DEFAULT_SIGNAL_PRICE_MOVE_PCT
+            price_move_pct = DEFAULT_ENTRY_PRICE_MOVE_PCT
 
-        now = datetime.now(TW_TZ)
-        now_ts = now.timestamp()
-        bucket_id = int(now_ts // window_sec)
+        try:
+            early_5s_pct = max(0.1, float(early_5s_pct))
+        except Exception:
+            early_5s_pct = DEFAULT_EARLY_5S_PCT
+
+        try:
+            early_10s_pct = max(0.1, float(early_10s_pct))
+        except Exception:
+            early_10s_pct = DEFAULT_EARLY_10S_PCT
+
+        try:
+            buy_pressure_ratio_threshold = max(0.0, min(1.0, float(buy_pressure_ratio_threshold)))
+        except Exception:
+            buy_pressure_ratio_threshold = DEFAULT_BUY_PRESSURE_RATIO
+
+        try:
+            cooldown_sec = max(0, int(cooldown_sec))
+        except Exception:
+            cooldown_sec = DEFAULT_SIGNAL_COOLDOWN_SEC
+
+        try:
+            min_current_volume = max(0, int(min_current_volume))
+        except Exception:
+            min_current_volume = DEFAULT_MIN_CURRENT_VOLUME
 
         with self.lock:
-            status = copy.deepcopy(self.tick_status.get(code, {
-                "last_ws_price": None,
-                "recent_ticks": [],
-                "price_points": [],
-            }))
+            status = copy.deepcopy(self.tick_status.get(code, self._default_status()))
 
         current_price = status.get("last_ws_price")
         recent_ticks = status.get("recent_ticks", [])
         price_points = status.get("price_points", [])
+        entry_state = status.get("entry_state") or self._default_status()["entry_state"]
 
-        current_window_ticks = []
-        previous_window_ticks = []
+        bucket_start_ts = int(now_ts // bucket_sec) * bucket_sec
+        previous_bucket_start_ts = bucket_start_ts - bucket_sec
+        elapsed_in_bucket = max(1.0, now_ts - bucket_start_ts)
 
-        for tick in recent_ticks:
-            tick_time = tick.get("time")
-            if not hasattr(tick_time, "timestamp"):
-                continue
+        current_volume = self._sum_tick_volume(
+            recent_ticks,
+            bucket_start_ts,
+            now_ts + 0.001,
+        )
 
-            age_sec = (now - tick_time).total_seconds()
+        previous_volume = self._sum_tick_volume(
+            recent_ticks,
+            previous_bucket_start_ts,
+            bucket_start_ts,
+        )
 
-            volume = 0
-            try:
-                volume = int(tick.get("volume") or 0)
-            except Exception:
-                volume = 0
+        current_buy_volume = self._sum_tick_volume(
+            recent_ticks,
+            bucket_start_ts,
+            now_ts + 0.001,
+            trade_type="外盤(買)",
+        )
 
-            if 0 <= age_sec <= window_sec:
-                current_window_ticks.append(tick)
-            elif window_sec < age_sec <= window_sec * 2:
-                previous_window_ticks.append(tick)
-
-        current_volume = sum(int(t.get("volume") or 0) for t in current_window_ticks)
-        previous_volume = sum(int(t.get("volume") or 0) for t in previous_window_ticks)
+        projected_bucket_volume = current_volume / elapsed_in_bucket * bucket_sec
 
         volume_ratio = None
         volume_ok = False
 
         if previous_volume > 0:
-            volume_ratio = current_volume / previous_volume
-            volume_ok = volume_ratio >= volume_ratio_threshold
+            volume_ratio = projected_bucket_volume / previous_volume
+            volume_ok = (
+                volume_ratio >= volume_ratio_threshold
+                and current_volume >= min_current_volume
+            )
 
-        current_window_prices = []
+        buy_pressure_ratio = None
+        buy_pressure_ok = False
 
-        for point in price_points:
-            point_time = point.get("time")
-            point_price = self._safe_float(point.get("price"))
+        if current_volume > 0:
+            buy_pressure_ratio = current_buy_volume / current_volume
+            buy_pressure_ok = buy_pressure_ratio >= buy_pressure_ratio_threshold
 
-            if not hasattr(point_time, "timestamp") or point_price is None or point_price <= 0:
-                continue
+        price_change_5s = self._price_change_from_seconds(price_points, current_price, 5)
+        price_change_10s = self._price_change_from_seconds(price_points, current_price, 10)
+        price_change_30s = self._price_change_from_seconds(price_points, current_price, bucket_sec)
 
-            age_sec = (now - point_time).total_seconds()
+        short_momentum_ok = (
+            (price_change_5s is not None and price_change_5s >= early_5s_pct)
+            or (price_change_10s is not None and price_change_10s >= early_10s_pct)
+            or (price_change_30s is not None and price_change_30s >= price_move_pct)
+        )
 
-            if 0 <= age_sec <= window_sec:
-                current_window_prices.append(point)
-
-        current_window_prices.sort(key=lambda x: x.get("time"))
-
-        start_30_price = None
-        price_change_30_pct = None
-
-        if current_window_prices:
-            start_30_price = self._safe_float(current_window_prices[0].get("price"))
-
-        if (
-            current_price is not None
-            and start_30_price is not None
-            and start_30_price > 0
-        ):
-            price_change_30_pct = (float(current_price) / float(start_30_price) - 1) * 100
-
+        track_start_ts = now_ts - track_sec
         track_prices = []
 
         for point in price_points:
             point_time = point.get("time")
-            point_price = self._safe_float(point.get("price"))
+            price = self._safe_float(point.get("price"))
 
-            if not hasattr(point_time, "timestamp") or point_price is None or point_price <= 0:
+            if not hasattr(point_time, "timestamp") or price is None or price <= 0:
                 continue
 
-            age_sec = (now - point_time).total_seconds()
+            if track_start_ts <= point_time.timestamp() <= now_ts:
+                track_prices.append(price)
 
-            if 0 <= age_sec <= track_sec:
-                track_prices.append(point_price)
-
-        low_1m = min(track_prices) if track_prices else None
-        high_1m = max(track_prices) if track_prices else None
+        low_track = min(track_prices) if track_prices else None
+        high_track = max(track_prices) if track_prices else None
 
         rise_from_low_pct = None
         drop_from_high_pct = None
+        near_high_breakout = False
 
-        if current_price is not None and low_1m is not None and low_1m > 0:
-            rise_from_low_pct = (float(current_price) / float(low_1m) - 1) * 100
+        if current_price is not None and low_track is not None and low_track > 0:
+            rise_from_low_pct = (float(current_price) / float(low_track) - 1) * 100
 
-        if current_price is not None and high_1m is not None and high_1m > 0:
-            drop_from_high_pct = (float(current_price) / float(high_1m) - 1) * 100
+        if current_price is not None and high_track is not None and high_track > 0:
+            drop_from_high_pct = (float(current_price) / float(high_track) - 1) * 100
+            near_high_breakout = float(current_price) >= float(high_track) * 0.998
 
-        condition1_up = (
-            volume_ok
-            and price_change_30_pct is not None
-            and price_change_30_pct >= price_move_pct
-        )
-
-        condition1_down = (
-            volume_ok
-            and price_change_30_pct is not None
-            and price_change_30_pct <= -price_move_pct
-        )
-
-        condition2_up = (
-            volume_ok
-            and rise_from_low_pct is not None
+        low_rebound_ok = (
+            rise_from_low_pct is not None
             and rise_from_low_pct >= price_move_pct
         )
 
-        condition2_down = (
+        position_ok = near_high_breakout or low_rebound_ok
+
+        armed = bool(entry_state.get("armed", False))
+        armed_at = entry_state.get("armed_at")
+        last_signal_at = entry_state.get("last_signal_at")
+
+        cooldown_ok = True
+
+        if hasattr(last_signal_at, "timestamp"):
+            cooldown_ok = (now - last_signal_at).total_seconds() >= cooldown_sec
+
+        if volume_ok and not armed:
+            entry_state["armed"] = True
+            entry_state["armed_at"] = now
+            entry_state["armed_low"] = low_track
+            entry_state["armed_high"] = high_track
+
+        if armed and hasattr(armed_at, "timestamp"):
+            armed_age = (now - armed_at).total_seconds()
+
+            if armed_age > track_sec:
+                entry_state["armed"] = False
+                entry_state["armed_at"] = None
+                entry_state["armed_low"] = None
+                entry_state["armed_high"] = None
+
+        warning_active = (
             volume_ok
-            and drop_from_high_pct is not None
-            and drop_from_high_pct <= -price_move_pct
+            and buy_pressure_ok
+            and (
+                (price_change_5s is not None and price_change_5s >= early_5s_pct)
+                or (price_change_10s is not None and price_change_10s >= early_10s_pct)
+            )
         )
 
-        active_conditions = []
+        entry_active = (
+            volume_ok
+            and buy_pressure_ok
+            and short_momentum_ok
+            and position_ok
+            and cooldown_ok
+        )
 
-        if condition1_up:
-            active_conditions.append("條件1急拉")
-        if condition1_down:
-            active_conditions.append("條件1急殺")
-        if condition2_up:
-            active_conditions.append("條件2低點拉抬")
-        if condition2_down:
-            active_conditions.append("條件2高點下跌")
+        if entry_active:
+            entry_state["last_signal_at"] = now
+            entry_state["armed"] = False
+            entry_state["armed_at"] = None
+            entry_state["armed_low"] = None
+            entry_state["armed_high"] = None
 
-        active = len(active_conditions) > 0
+        with self.lock:
+            self.tick_status.setdefault(code, self._default_status())["entry_state"] = entry_state
 
-        direction = "-"
-        if condition1_up or condition2_up:
-            direction = "拉抬"
-        elif condition1_down or condition2_down:
-            direction = "下跌"
-
-        if active:
-            icon = "🚀" if direction == "拉抬" else "📉"
+        if entry_active:
             text = (
-                f"{icon} {direction}訊號｜"
-                f"{'、'.join(active_conditions)}｜"
-                f"本30秒量 {current_volume} / 前30秒量 {previous_volume}｜"
+                f"🚀 進場訊號｜"
+                f"預估{bucket_sec}秒量 {int(projected_bucket_volume)} / 前{bucket_sec}秒量 {int(previous_volume)}｜"
                 f"量比 {format_ratio_value(volume_ratio)}｜"
-                f"30秒變化 {format_signed_pct(price_change_30_pct)}｜"
-                f"1分低點拉抬 {format_signed_pct(rise_from_low_pct)}｜"
-                f"1分高點變化 {format_signed_pct(drop_from_high_pct)}"
+                f"外盤占比 {format_percent_ratio(buy_pressure_ratio)}｜"
+                f"5秒 {format_signed_pct(price_change_5s)}｜"
+                f"10秒 {format_signed_pct(price_change_10s)}｜"
+                f"{bucket_sec}秒 {format_signed_pct(price_change_30s)}｜"
+                f"{track_sec}秒低點拉抬 {format_signed_pct(rise_from_low_pct)}"
             )
+            signal_level = "entry"
+
+        elif warning_active:
+            text = (
+                f"⚠️ 預警｜"
+                f"預估{bucket_sec}秒量 {int(projected_bucket_volume)} / 前{bucket_sec}秒量 {int(previous_volume)}｜"
+                f"量比 {format_ratio_value(volume_ratio)}｜"
+                f"外盤占比 {format_percent_ratio(buy_pressure_ratio)}｜"
+                f"5秒 {format_signed_pct(price_change_5s)}｜"
+                f"10秒 {format_signed_pct(price_change_10s)}"
+            )
+            signal_level = "warning"
+
         else:
             text = "監控中"
+            signal_level = "none"
 
         signal_key = (
-            f"{code}_{bucket_id}_{direction}_"
-            f"{'_'.join(active_conditions)}_"
-            f"cv{current_volume}_pv{previous_volume}_"
-            f"p{current_price}"
+            f"{code}_{int(now_ts // 5)}_{signal_level}_"
+            f"cv{current_volume}_pv{previous_volume}_p{current_price}"
         )
 
         return {
-            "active": bool(active),
-            "code": code,
-            "time": now,
-            "bucket_id": bucket_id,
-            "direction": direction,
-            "conditions": active_conditions,
+            "active": bool(entry_active),
+            "warning": bool(warning_active),
+            "signal_level": signal_level,
             "text": text,
+            "time": now,
+            "signal_key": signal_key,
             "current_price": current_price,
             "current_volume": int(current_volume),
             "previous_volume": int(previous_volume),
+            "projected_bucket_volume": int(projected_bucket_volume),
             "volume_ratio": volume_ratio,
-            "volume_ok": bool(volume_ok),
-            "start_30_price": start_30_price,
-            "price_change_30_pct": price_change_30_pct,
-            "low_1m": low_1m,
-            "high_1m": high_1m,
+            "buy_pressure_ratio": buy_pressure_ratio,
+            "price_change_5s": price_change_5s,
+            "price_change_10s": price_change_10s,
+            "price_change_30s": price_change_30s,
+            "low_track": low_track,
+            "high_track": high_track,
             "rise_from_low_pct": rise_from_low_pct,
             "drop_from_high_pct": drop_from_high_pct,
-            "signal_key": signal_key,
-            "window_sec": window_sec,
+            "near_high_breakout": near_high_breakout,
+            "volume_ok": volume_ok,
+            "buy_pressure_ok": buy_pressure_ok,
+            "short_momentum_ok": short_momentum_ok,
+            "position_ok": position_ok,
+            "bucket_sec": bucket_sec,
             "track_sec": track_sec,
-            "volume_ratio_threshold": volume_ratio_threshold,
-            "price_move_pct": price_move_pct,
         }
 
     def get_status(self):
@@ -1291,17 +1409,32 @@ if "auto_refresh_enabled" not in st.session_state:
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 
-if "signal_window_sec" not in st.session_state:
-    st.session_state.signal_window_sec = DEFAULT_SIGNAL_WINDOW_SEC
+if "entry_bucket_sec" not in st.session_state:
+    st.session_state.entry_bucket_sec = DEFAULT_ENTRY_BUCKET_SEC
 
-if "signal_track_sec" not in st.session_state:
-    st.session_state.signal_track_sec = DEFAULT_SIGNAL_TRACK_SEC
+if "entry_track_sec" not in st.session_state:
+    st.session_state.entry_track_sec = DEFAULT_ENTRY_TRACK_SEC
 
-if "signal_volume_ratio" not in st.session_state:
-    st.session_state.signal_volume_ratio = DEFAULT_SIGNAL_VOLUME_RATIO
+if "entry_volume_ratio" not in st.session_state:
+    st.session_state.entry_volume_ratio = DEFAULT_ENTRY_VOLUME_RATIO
 
-if "signal_price_move_pct" not in st.session_state:
-    st.session_state.signal_price_move_pct = DEFAULT_SIGNAL_PRICE_MOVE_PCT
+if "entry_price_move_pct" not in st.session_state:
+    st.session_state.entry_price_move_pct = DEFAULT_ENTRY_PRICE_MOVE_PCT
+
+if "entry_early_5s_pct" not in st.session_state:
+    st.session_state.entry_early_5s_pct = DEFAULT_EARLY_5S_PCT
+
+if "entry_early_10s_pct" not in st.session_state:
+    st.session_state.entry_early_10s_pct = DEFAULT_EARLY_10S_PCT
+
+if "entry_buy_pressure_ratio" not in st.session_state:
+    st.session_state.entry_buy_pressure_ratio = DEFAULT_BUY_PRESSURE_RATIO
+
+if "entry_cooldown_sec" not in st.session_state:
+    st.session_state.entry_cooldown_sec = DEFAULT_SIGNAL_COOLDOWN_SEC
+
+if "entry_min_current_volume" not in st.session_state:
+    st.session_state.entry_min_current_volume = DEFAULT_MIN_CURRENT_VOLUME
 
 if "stock_groups" not in st.session_state:
     st.session_state.stock_groups = load_stock_groups()
@@ -1332,11 +1465,11 @@ if "fubon_manager" not in st.session_state:
 if "fubon_logged_in" not in st.session_state:
     st.session_state.fubon_logged_in = False
 
-if "signal_toast_keys" not in st.session_state:
-    st.session_state.signal_toast_keys = set()
+if "entry_signal_toast_keys" not in st.session_state:
+    st.session_state.entry_signal_toast_keys = set()
 
-if "_signal_toast_messages" not in st.session_state:
-    st.session_state._signal_toast_messages = []
+if "_entry_signal_toast_messages" not in st.session_state:
+    st.session_state._entry_signal_toast_messages = []
 
 
 def show_pending_toasts():
@@ -1344,15 +1477,19 @@ def show_pending_toasts():
         st.toast(st.session_state._quick_add_success_message, duration="long")
         del st.session_state._quick_add_success_message
 
-    messages = st.session_state.get("_signal_toast_messages", [])
+    messages = st.session_state.get("_entry_signal_toast_messages", [])
+
     if messages:
         for msg in messages[-5:]:
-            st.toast(msg, icon="🚨", duration="long")
-        st.session_state._signal_toast_messages = []
+            st.toast(msg, icon="🚀", duration="long")
+        st.session_state._entry_signal_toast_messages = []
 
 
-def queue_signal_toast(group_name, code, stock_name, signal, change_pct):
-    if not signal or not signal.get("active"):
+def queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct):
+    if not signal:
+        return
+
+    if not signal.get("active") and not signal.get("warning"):
         return
 
     signal_key = signal.get("signal_key")
@@ -1360,7 +1497,7 @@ def queue_signal_toast(group_name, code, stock_name, signal, change_pct):
     if not signal_key:
         return
 
-    if signal_key in st.session_state.signal_toast_keys:
+    if signal_key in st.session_state.entry_signal_toast_keys:
         return
 
     signal_time = signal.get("time")
@@ -1368,18 +1505,20 @@ def queue_signal_toast(group_name, code, stock_name, signal, change_pct):
     current_price = signal.get("current_price")
     price_text = format_price_value(current_price)
 
+    prefix = "🚀 進場訊號" if signal.get("active") else "⚠️ 預警"
+
     msg = (
-        f"🚨 量價異常訊號\n"
+        f"{prefix}\n"
         f"{group_name}｜{code} {stock_name}\n"
         f"{signal.get('text')}\n"
         f"現價：{price_text}｜漲幅：{format_pct_value(change_pct)}｜時間：{time_text}"
     )
 
-    st.session_state._signal_toast_messages.append(msg)
-    st.session_state.signal_toast_keys.add(signal_key)
+    st.session_state._entry_signal_toast_messages.append(msg)
+    st.session_state.entry_signal_toast_keys.add(signal_key)
 
-    if len(st.session_state.signal_toast_keys) > 500:
-        st.session_state.signal_toast_keys = set(list(st.session_state.signal_toast_keys)[-300:])
+    if len(st.session_state.entry_signal_toast_keys) > 700:
+        st.session_state.entry_signal_toast_keys = set(list(st.session_state.entry_signal_toast_keys)[-400:])
 
 
 show_pending_toasts()
@@ -1432,6 +1571,7 @@ def render_fubon_login():
         st.session_state.fubon_manager = FubonRealtimeManager()
         st.session_state.fubon_logged_in = False
         st.session_state.pop("fubon_login_time", None)
+        st.session_state.entry_signal_toast_keys = set()
         st.rerun()
 
     if st.session_state.fubon_logged_in:
@@ -1447,9 +1587,9 @@ def render_fubon_login():
         c1, c2 = st.sidebar.columns(2)
 
         with c1:
-            if st.button("盤中累積歸零", width="stretch"):
+            if st.button("盤中資料歸零", width="stretch"):
                 manager.reset_runtime_data()
-                st.session_state.signal_toast_keys = set()
+                st.session_state.entry_signal_toast_keys = set()
                 st.rerun()
 
         with c2:
@@ -1735,24 +1875,19 @@ if os.path.exists(APP_LOGO):
         st.image(APP_LOGO, width=58)
 
     with title_text_col:
-        st.markdown("## ⚡ 盤中即時成交監控")
+        st.markdown("## 🚀 盤中瞬間拉抬進場監控")
 else:
-    st.markdown("## ⚡ 盤中即時成交監控")
+    st.markdown("## 🚀 盤中瞬間拉抬進場監控")
 
 
-control_col1, control_col2, control_col3, control_col4, control_col5, control_col6, control_col7, control_col8 = st.columns(
-    [1, 1, 1, 1, 1, 1, 1, 1]
-)
+control_cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
 
-with control_col1:
-    if st.button("🔄 手動刷新畫面", width="stretch"):
+with control_colsif st.button("🔄 手動刷新", width="stretch"):
         st.rerun()
 
-with control_col2:
-    st.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
+with control_colsst.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
 
-with control_col3:
-    st.number_input(
+with control_colsst.number_input(
         "刷新秒數",
         min_value=1,
         max_value=60,
@@ -1760,53 +1895,69 @@ with control_col3:
         key="refresh_sec",
     )
 
-with control_col4:
-    pct_threshold = st.number_input(
-        "漲幅門檻 (%)",
+with control_colspct_threshold = st.number_input(
+        "漲幅門檻%",
         min_value=0.0,
         max_value=10.0,
-        value=5.0,
+        value=2.0,
         step=0.5,
     )
 
-with control_col5:
-    st.number_input(
-        "量能視窗秒數",
+with control_colsst.number_input(
+        "量能視窗秒",
         min_value=5,
         max_value=120,
         step=5,
-        key="signal_window_sec",
-        help="預設 30 秒；用來比較目前視窗成交量與上一個視窗成交量。",
+        key="entry_bucket_sec",
     )
 
-with control_col6:
-    st.number_input(
-        "追蹤高低點秒數",
+with control_colsst.number_input(
+        "高低點追蹤秒",
         min_value=10,
         max_value=300,
         step=10,
-        key="signal_track_sec",
-        help="預設 60 秒；用來追蹤最近一分鐘低點 / 高點。",
+        key="entry_track_sec",
     )
 
-with control_col7:
-    st.number_input(
+with control_colsst.number_input(
         "量比門檻",
         min_value=0.1,
         max_value=10.0,
         step=0.1,
-        key="signal_volume_ratio",
-        help="預設 1.3；目前 30 秒成交量需大於上一個 30 秒成交量的 1.3 倍。",
+        key="entry_volume_ratio",
     )
 
-with control_col8:
-    st.number_input(
-        "價格變動門檻 (%)",
+with control_colsst.number_input(
+        "價格變動%",
         min_value=0.1,
         max_value=10.0,
         step=0.1,
-        key="signal_price_move_pct",
-        help="預設 2%；符合拉抬或下跌幅度時發出訊號。",
+        key="entry_price_move_pct",
+    )
+
+with control_colsst.number_input(
+        "外盤占比",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.05,
+        key="entry_buy_pressure_ratio",
+        help="0.55 = 外盤占比 55%",
+    )
+
+with control_colsst.number_input(
+        "最低本段量",
+        min_value=0,
+        max_value=10000,
+        step=10,
+        key="entry_min_current_volume",
+    )
+
+with control_colsst.number_input(
+        "冷卻秒數",
+        min_value=0,
+        max_value=300,
+        step=5,
+        key="entry_cooldown_sec",
     )
 
 
@@ -1855,22 +2006,26 @@ if status["error"]:
     st.error(status["error"])
 
 st.info(
-    "即時價由富邦 WebSocket trades 抓取；"
-    "最新單筆優先使用富邦 trades 的 size 單筆成交量；若無 size 才用累積量差值；"
-    "漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。"
-    "yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。"
+    "訊號邏輯：使用預估量提早捕捉瞬間拉抬。"
+    "預估目前量能視窗成交量 > 前一視窗成交量 × 量比門檻，"
+    "且外盤占比達標，並搭配 5秒 / 10秒 / 30秒漲幅、60秒高低點突破判斷。"
 )
 
 st.caption(
-    f"✅ 量價訊號條件："
-    f"目前 {int(st.session_state.signal_window_sec)} 秒成交量 > 上一個 {int(st.session_state.signal_window_sec)} 秒成交量 × {float(st.session_state.signal_volume_ratio):.1f}，"
-    f"且 30 秒內價格變化 ≥ ±{float(st.session_state.signal_price_move_pct):.1f}% "
-    f"或最近 {int(st.session_state.signal_track_sec)} 秒高低點反彈 / 回落 ≥ ±{float(st.session_state.signal_price_move_pct):.1f}%。"
+    f"✅ 目前條件：量能視窗 {int(st.session_state.entry_bucket_sec)} 秒｜"
+    f"預估量比 ≥ {float(st.session_state.entry_volume_ratio):.2f}x｜"
+    f"價格變動 ≥ {float(st.session_state.entry_price_move_pct):.1f}%｜"
+    f"5秒預警 ≥ {float(st.session_state.entry_early_5s_pct):.1f}%｜"
+    f"10秒預警 ≥ {float(st.session_state.entry_early_10s_pct):.1f}%｜"
+    f"外盤占比 ≥ {float(st.session_state.entry_buy_pressure_ratio) * 100:.0f}%｜"
+    f"高低點追蹤 {int(st.session_state.entry_track_sec)} 秒｜"
+    f"最低本段量 {int(st.session_state.entry_min_current_volume)} 張｜"
+    f"冷卻 {int(st.session_state.entry_cooldown_sec)} 秒"
 )
 
 
 # =============================================================================
-# 整理資料：儀表板與明細表
+# 整理資料
 # =============================================================================
 group_tables = {}
 dashboard_items = []
@@ -1889,7 +2044,8 @@ for group_name, stocks in st.session_state.stock_groups.items():
     known_pct_count = 0
     up_count = 0
     down_count = 0
-    signal_count = 0
+    warning_count = 0
+    entry_count = 0
     top_pct_items = []
     group_signal_messages = []
 
@@ -1905,13 +2061,23 @@ for group_name, stocks in st.session_state.stock_groups.items():
         total_buy_vol = int(tick_status.get("total_buy_vol", 0) or 0)
         total_sell_vol = int(tick_status.get("total_sell_vol", 0) or 0)
 
-        signal = manager.get_volume_price_signal(
+        signal = manager.get_entry_signal(
             symbol,
-            window_sec=st.session_state.signal_window_sec,
-            track_sec=st.session_state.signal_track_sec,
-            volume_ratio_threshold=st.session_state.signal_volume_ratio,
-            price_move_pct=st.session_state.signal_price_move_pct,
-        ) if manager is not None else {"active": False, "text": "監控中"}
+            bucket_sec=st.session_state.entry_bucket_sec,
+            track_sec=st.session_state.entry_track_sec,
+            volume_ratio_threshold=st.session_state.entry_volume_ratio,
+            price_move_pct=st.session_state.entry_price_move_pct,
+            early_5s_pct=st.session_state.entry_early_5s_pct,
+            early_10s_pct=st.session_state.entry_early_10s_pct,
+            buy_pressure_ratio_threshold=st.session_state.entry_buy_pressure_ratio,
+            cooldown_sec=st.session_state.entry_cooldown_sec,
+            min_current_volume=st.session_state.entry_min_current_volume,
+        ) if manager is not None else {
+            "active": False,
+            "warning": False,
+            "signal_level": "none",
+            "text": "監控中",
+        }
 
         yesterday_close, close_date, yf_source = get_yfinance_yesterday_close(symbol)
 
@@ -1943,8 +2109,11 @@ for group_name, stocks in st.session_state.stock_groups.items():
                 pct_hit_count += 1
 
         if signal.get("active"):
-            signal_count += 1
+            entry_count += 1
+        elif signal.get("warning"):
+            warning_count += 1
 
+        if signal.get("active") or signal.get("warning"):
             signal_msg = {
                 "group": group_name,
                 "code": code,
@@ -1952,32 +2121,35 @@ for group_name, stocks in st.session_state.stock_groups.items():
                 "text": signal.get("text", ""),
                 "time": signal.get("time"),
                 "pct": change_pct,
-                "direction": signal.get("direction", "-"),
+                "level": signal.get("signal_level", "none"),
             }
 
             group_signal_messages.append(signal_msg)
             recent_signals.append(signal_msg)
-
-            queue_signal_toast(group_name, code, stock_name, signal, change_pct)
+            queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
-            "量價訊號": signal.get("text", "監控中"),
+            "進場訊號": signal.get("text", "監控中"),
             "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
             "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
             "內外盤": trade_type,
             "外盤累積": total_buy_vol,
             "內盤累積": total_sell_vol,
-            "本30秒量": signal.get("current_volume", 0),
-            "前30秒量": signal.get("previous_volume", 0),
-            "30秒量比": format_ratio_value(signal.get("volume_ratio")),
-            "30秒價格變化": format_signed_pct(signal.get("price_change_30_pct")),
-            "1分低點": format_price_value(signal.get("low_1m")),
-            "1分高點": format_price_value(signal.get("high_1m")),
-            "1分低點拉抬": format_signed_pct(signal.get("rise_from_low_pct")),
-            "1分高點下跌": format_signed_pct(signal.get("drop_from_high_pct")),
+            "本段量": signal.get("current_volume", 0),
+            "前段量": signal.get("previous_volume", 0),
+            "預估本段量": signal.get("projected_bucket_volume", 0),
+            "量比": format_ratio_value(signal.get("volume_ratio")),
+            "外盤占比": format_percent_ratio(signal.get("buy_pressure_ratio")),
+            "5秒漲幅": format_signed_pct(signal.get("price_change_5s")),
+            "10秒漲幅": format_signed_pct(signal.get("price_change_10s")),
+            "30秒漲幅": format_signed_pct(signal.get("price_change_30s")),
+            "60秒低點": format_price_value(signal.get("low_track")),
+            "60秒高點": format_price_value(signal.get("high_track")),
+            "低點拉抬": format_signed_pct(signal.get("rise_from_low_pct")),
+            "高點回落": format_signed_pct(signal.get("drop_from_high_pct")),
             "昨收日期": close_date or "-",
             "昨收來源": yf_source,
         })
@@ -2013,7 +2185,8 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "pct_hit_ratio": pct_hit_ratio,
         "up_count": up_count,
         "down_count": down_count,
-        "signal_count": signal_count,
+        "warning_count": warning_count,
+        "entry_count": entry_count,
         "top_pct_text": top_pct_text,
         "signal_text": signal_text,
     })
@@ -2023,21 +2196,25 @@ for group_name, stocks in st.session_state.stock_groups.items():
         columns=[
             "代碼",
             "股票名稱",
-            "量價訊號",
+            "進場訊號",
             "即時價",
             "漲幅%",
             "最新單筆",
             "內外盤",
             "外盤累積",
             "內盤累積",
-            "本30秒量",
-            "前30秒量",
-            "30秒量比",
-            "30秒價格變化",
-            "1分低點",
-            "1分高點",
-            "1分低點拉抬",
-            "1分高點下跌",
+            "本段量",
+            "前段量",
+            "預估本段量",
+            "量比",
+            "外盤占比",
+            "5秒漲幅",
+            "10秒漲幅",
+            "30秒漲幅",
+            "60秒低點",
+            "60秒高點",
+            "低點拉抬",
+            "高點回落",
             "昨收日期",
             "昨收來源",
         ],
@@ -2055,14 +2232,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("### 📌 量價訊號儀表板")
+st.markdown("### 📌 瞬間拉抬進場儀表板")
 
 st.caption(
     f"漲幅達標門檻：≥ {pct_threshold:.1f}%｜"
-    f"量能視窗：{int(st.session_state.signal_window_sec)} 秒｜"
-    f"量比門檻：{float(st.session_state.signal_volume_ratio):.1f}x｜"
-    f"價格變動門檻：±{float(st.session_state.signal_price_move_pct):.1f}%｜"
-    f"高低點追蹤：{int(st.session_state.signal_track_sec)} 秒｜"
+    f"量能視窗：{int(st.session_state.entry_bucket_sec)} 秒｜"
+    f"預估量比門檻：{float(st.session_state.entry_volume_ratio):.2f}x｜"
+    f"外盤占比：{float(st.session_state.entry_buy_pressure_ratio) * 100:.0f}%｜"
+    f"價格變動門檻：{float(st.session_state.entry_price_move_pct):.1f}%｜"
+    f"高低點追蹤：{int(st.session_state.entry_track_sec)} 秒｜"
     f"yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC // 60} 分鐘"
 )
 
@@ -2077,31 +2255,26 @@ st.caption(
 card_html_parts = ['<div class="dashboard-grid">']
 
 for item in dashboard_items:
-    pct_ratio = float(item.get("pct_hit_ratio", 0) or 0)
-
-    if item.get("signal_count", 0) > 0:
-        card_class = "dash-card pct-high"
-    elif pct_ratio >= 70:
-        card_class = "dash-card pct-high"
-    elif pct_ratio >= 40:
-        card_class = "dash-card pct-mid"
-    elif pct_ratio > 0:
-        card_class = "dash-card pct-low"
-    else:
-        card_class = "dash-card pct-zero"
-
     anchor_id = make_anchor_id(item["group"])
 
+    if item["entry_count"] > 0:
+        card_class = "dash-card entry"
+    elif item["warning_count"] > 0:
+        card_class = "dash-card warn"
+    elif item["pct_hit_count"] > 0:
+        card_class = "dash-card normal"
+    else:
+        card_class = "dash-card idle"
+
     card_html_parts.append(
-        f'#{anchor_id} 明細表">'
-        f'<div class="{card_class}">'
-        f'<div class="dash-title">{escape_html(item["group"])}</div>'
-        f'<div class="dash-big">訊號 {item["signal_count"]} 檔</div>'
+        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_  f'<div class="dash-title">{escape_html(item["group"])}</div>'
+        f'<div class="dash-big">🚀 {item["entry_count"]}｜⚠️ {item["warning_count"]}</div>'
+        f'<div class="dash-line">進場訊號：<b>{item["entry_count"]}</b> 檔｜預警：<b>{item["warning_count"]}</b> 檔</div>'
         f'<div class="dash-line">漲幅達標（≥{pct_threshold:.1f}%）：'
         f'<b>{item["pct_hit_count"]} / {item["total"]}</b>，比例 <b>{item["pct_hit_ratio"]:.0f}%</b></div>'
         f'<div class="dash-line">🔴 上漲：<b>{item["up_count"]}</b>　'
         f'🟢 下跌：<b>{item["down_count"]}</b></div>'
-        f'<div class="dash-small"><b>最新量價訊號</b><br>{item["signal_text"]}</div>'
+        f'<div class="dash-small"><b>最新訊號</b><br>{item["signal_text"]}</div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
         f'</div></a>'
     )
@@ -2116,18 +2289,24 @@ recent_signals.sort(
     reverse=True,
 )
 
-st.caption(f"本輪掃到量價訊號：{len(recent_signals)} 檔")
+st.caption(f"本輪掃到訊號：{len(recent_signals)} 檔")
 
 if recent_signals:
-    st.markdown("#### 🚨 最近量價訊號")
+    st.markdown("#### 🚨 最近預警 / 進場訊號")
     recent_cols = st.columns(min(3, len(recent_signals)))
 
     for idx, item in enumerate(recent_signals[:6]):
         with recent_cols[idx % len(recent_cols)]:
-            st.warning(
-                f"{item['group']}｜{item['code']} {item['name']}\n\n"
-                f"{item['text']}"
-            )
+            if item["level"] == "entry":
+                st.error(
+                    f"{item['group']}｜{item['code']} {item['name']}\n\n"
+                    f"{item['text']}"
+                )
+            else:
+                st.warning(
+                    f"{item['group']}｜{item['code']} {item['name']}\n\n"
+                    f"{item['text']}"
+                )
 
 st.divider()
 
@@ -2150,9 +2329,8 @@ for group_name, display_df in group_tables.items():
 
     with table_header_col2:
         st.markdown(
-            '<div style="text-align:right; padding-top: 0.6rem;">'
-            '#dashboard-top⬆️ 返回儀表板</a>'
-            '</div>',
+            '<div class="return-link-wrap">'
+            '<a href="#dashboard-top">⬆️ 返回儀表板       '</div>',
             unsafe_allow_html=True,
         )
 
@@ -2167,9 +2345,9 @@ for group_name, display_df in group_tables.items():
                 display_text=r"https://tw.stock.yahoo.com/quote/(.*)",
             ),
             "股票名稱": st.column_config.TextColumn("股票名稱"),
-            "量價訊號": st.column_config.TextColumn(
-                "量價訊號",
-                help="條件1：30秒量比放大且30秒內漲跌達門檻；條件2：30秒量比放大且1分鐘高低點突破達門檻。",
+            "進場訊號": st.column_config.TextColumn(
+                "進場訊號",
+                help="預警：預估量放大 + 外盤占比 + 5秒/10秒短線漲幅。進場：再加上突破高點或低點急拉確認。",
             ),
             "即時價": st.column_config.TextColumn(
                 "即時價",
@@ -2186,14 +2364,18 @@ for group_name, display_df in group_tables.items():
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
             "內盤累積": st.column_config.NumberColumn("內盤累積"),
-            "本30秒量": st.column_config.NumberColumn("本30秒量"),
-            "前30秒量": st.column_config.NumberColumn("前30秒量"),
-            "30秒量比": st.column_config.TextColumn("30秒量比"),
-            "30秒價格變化": st.column_config.TextColumn("30秒價格變化"),
-            "1分低點": st.column_config.TextColumn("1分低點"),
-            "1分高點": st.column_config.TextColumn("1分高點"),
-            "1分低點拉抬": st.column_config.TextColumn("1分低點拉抬"),
-            "1分高點下跌": st.column_config.TextColumn("1分高點下跌"),
+            "本段量": st.column_config.NumberColumn("本段量"),
+            "前段量": st.column_config.NumberColumn("前段量"),
+            "預估本段量": st.column_config.NumberColumn("預估本段量"),
+            "量比": st.column_config.TextColumn("量比"),
+            "外盤占比": st.column_config.TextColumn("外盤占比"),
+            "5秒漲幅": st.column_config.TextColumn("5秒漲幅"),
+            "10秒漲幅": st.column_config.TextColumn("10秒漲幅"),
+            "30秒漲幅": st.column_config.TextColumn("30秒漲幅"),
+            "60秒低點": st.column_config.TextColumn("60秒低點"),
+            "60秒高點": st.column_config.TextColumn("60秒高點"),
+            "低點拉抬": st.column_config.TextColumn("低點拉抬"),
+            "高點回落": st.column_config.TextColumn("高點回落"),
             "昨收日期": st.column_config.TextColumn("昨收日期"),
             "昨收來源": st.column_config.TextColumn("昨收來源"),
         },
@@ -2210,6 +2392,41 @@ with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
     if msg:
         st.caption(f"時間：{msg['time'].strftime('%Y-%m-%d %H:%M:%S')}")
         st.json(msg["raw"])
+
+        debug_signal = manager.get_entry_signal(
+            debug_code,
+            bucket_sec=st.session_state.entry_bucket_sec,
+            track_sec=st.session_state.entry_track_sec,
+            volume_ratio_threshold=st.session_state.entry_volume_ratio,
+            price_move_pct=st.session_state.entry_price_move_pct,
+            early_5s_pct=st.session_state.entry_early_5s_pct,
+            early_10s_pct=st.session_state.entry_early_10s_pct,
+            buy_pressure_ratio_threshold=st.session_state.entry_buy_pressure_ratio,
+            cooldown_sec=st.session_state.entry_cooldown_sec,
+            min_current_volume=st.session_state.entry_min_current_volume,
+        )
+
+        st.markdown("### 訊號 Debug")
+        st.json({
+            "訊號": debug_signal.get("text"),
+            "本段量": debug_signal.get("current_volume"),
+            "前段量": debug_signal.get("previous_volume"),
+            "預估本段量": debug_signal.get("projected_bucket_volume"),
+            "量比": debug_signal.get("volume_ratio"),
+            "外盤占比": debug_signal.get("buy_pressure_ratio"),
+            "5秒漲幅": debug_signal.get("price_change_5s"),
+            "10秒漲幅": debug_signal.get("price_change_10s"),
+            "30秒漲幅": debug_signal.get("price_change_30s"),
+            "60秒低點": debug_signal.get("low_track"),
+            "60秒高點": debug_signal.get("high_track"),
+            "低點拉抬": debug_signal.get("rise_from_low_pct"),
+            "突破高點": debug_signal.get("near_high_breakout"),
+            "volume_ok": debug_signal.get("volume_ok"),
+            "buy_pressure_ok": debug_signal.get("buy_pressure_ok"),
+            "short_momentum_ok": debug_signal.get("short_momentum_ok"),
+            "position_ok": debug_signal.get("position_ok"),
+        })
+
     else:
         st.caption("尚未收到此代碼的 WebSocket 訊息")
 
