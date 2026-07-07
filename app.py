@@ -1880,14 +1880,17 @@ else:
     st.markdown("## 🚀 盤中瞬間拉抬進場監控")
 
 
-control_cols = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+control_cols = st.columns(11)
 
-with control_colsif st.button("🔄 手動刷新", width="stretch"):
+with control_cols[0]:
+    if st.button("🔄 手動刷新", width="stretch"):
         st.rerun()
 
-with control_colsst.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
+with control_cols[1]:
+    st.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
 
-with control_colsst.number_input(
+with control_cols[2]:
+    st.number_input(
         "刷新秒數",
         min_value=1,
         max_value=60,
@@ -1895,7 +1898,8 @@ with control_colsst.number_input(
         key="refresh_sec",
     )
 
-with control_colspct_threshold = st.number_input(
+with control_cols[3]:
+    pct_threshold = st.number_input(
         "漲幅門檻%",
         min_value=0.0,
         max_value=10.0,
@@ -1903,7 +1907,8 @@ with control_colspct_threshold = st.number_input(
         step=0.5,
     )
 
-with control_colsst.number_input(
+with control_cols[4]:
+    st.number_input(
         "量能視窗秒",
         min_value=5,
         max_value=120,
@@ -1911,7 +1916,8 @@ with control_colsst.number_input(
         key="entry_bucket_sec",
     )
 
-with control_colsst.number_input(
+with control_cols[5]:
+    st.number_input(
         "高低點追蹤秒",
         min_value=10,
         max_value=300,
@@ -1919,7 +1925,8 @@ with control_colsst.number_input(
         key="entry_track_sec",
     )
 
-with control_colsst.number_input(
+with control_cols[6]:
+    st.number_input(
         "量比門檻",
         min_value=0.1,
         max_value=10.0,
@@ -1927,7 +1934,8 @@ with control_colsst.number_input(
         key="entry_volume_ratio",
     )
 
-with control_colsst.number_input(
+with control_cols[7]:
+    st.number_input(
         "價格變動%",
         min_value=0.1,
         max_value=10.0,
@@ -1935,7 +1943,8 @@ with control_colsst.number_input(
         key="entry_price_move_pct",
     )
 
-with control_colsst.number_input(
+with control_cols[8]:
+    st.number_input(
         "外盤占比",
         min_value=0.0,
         max_value=1.0,
@@ -1944,7 +1953,8 @@ with control_colsst.number_input(
         help="0.55 = 外盤占比 55%",
     )
 
-with control_colsst.number_input(
+with control_cols[9]:
+    st.number_input(
         "最低本段量",
         min_value=0,
         max_value=10000,
@@ -1952,7 +1962,8 @@ with control_colsst.number_input(
         key="entry_min_current_volume",
     )
 
-with control_colsst.number_input(
+with control_cols[10]:
+    st.number_input(
         "冷卻秒數",
         min_value=0,
         max_value=300,
@@ -2267,12 +2278,14 @@ for item in dashboard_items:
         card_class = "dash-card idle"
 
     card_html_parts.append(
-        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_  f'<div class="dash-title">{escape_html(item["group"])}</div>'
+        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])}">'
+        f'<div class="{card_class}">'
+        f'<div class="dash-title">{escape_html(item["group"])}</div>'
         f'<div class="dash-big">🚀 {item["entry_count"]}｜⚠️ {item["warning_count"]}</div>'
         f'<div class="dash-line">進場訊號：<b>{item["entry_count"]}</b> 檔｜預警：<b>{item["warning_count"]}</b> 檔</div>'
         f'<div class="dash-line">漲幅達標（≥{pct_threshold:.1f}%）：'
         f'<b>{item["pct_hit_count"]} / {item["total"]}</b>，比例 <b>{item["pct_hit_ratio"]:.0f}%</b></div>'
-        f'<div class="dash-line">🔴 上漲：<b>{item["up_count"]}</b>　'
+        f'<div class="dash-line">🔴 上漲：<b>{item["up_count"]}</b> '
         f'🟢 下跌：<b>{item["down_count"]}</b></div>'
         f'<div class="dash-small"><b>最新訊號</b><br>{item["signal_text"]}</div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
@@ -2330,7 +2343,8 @@ for group_name, display_df in group_tables.items():
     with table_header_col2:
         st.markdown(
             '<div class="return-link-wrap">'
-            '<a href="#dashboard-top">⬆️ 返回儀表板       '</div>',
+            '<a href="#dashboard-top">⬆️ 返回儀表板</a>'
+            '</div>',
             unsafe_allow_html=True,
         )
 
