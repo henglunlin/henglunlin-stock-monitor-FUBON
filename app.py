@@ -5,8 +5,17 @@
 重點：
 1. 富邦 WebSocket 負責盤中即時價、單筆量、內外盤。
 2. yfinance 只用來抓「昨日收盤價」，一小時更新一次，並存入本地 JSON 歷史快取。
-3. 表格顯示：代碼 Yahoo 連結｜股票名稱｜即時價｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
-4. 已移除所有「大單判定」、「大單提醒」、「秒級拉抬」、「Telegram 推播」相關邏輯。
+3. 表格顯示：代碼 Yahoo 連結｜股票名稱｜量價訊號｜即時價｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
+4. 已重新定義訊號條件：
+   條件1：
+     用 30 秒為單位紀錄成交量。
+     當目前 30 秒成交量 > 上一個 30 秒成交量 × 1.3，
+     且目前 30 秒內股價拉抬 >= 2% 或下跌 <= -2% 時，發出訊號。
+   條件2：
+     用 30 秒為單位紀錄成交量。
+     當目前 30 秒成交量 > 上一個 30 秒成交量 × 1.3，
+     並追蹤最近 1 分鐘低點 / 高點，
+     當股價自 1 分鐘低點拉抬 >= 2%，或自 1 分鐘高點下跌 >= 2% 時，發出訊號。
 """
 
 import os
@@ -46,6 +55,11 @@ APP_LOGO = "jerry.jpg"
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
 
+DEFAULT_SIGNAL_WINDOW_SEC = 30
+DEFAULT_SIGNAL_TRACK_SEC = 60
+DEFAULT_SIGNAL_VOLUME_RATIO = 1.3
+DEFAULT_SIGNAL_PRICE_MOVE_PCT = 2.0
+
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
         "2330.TW", "00981A.TW", "2449.TW", "2317.TW", "3711.TW",
@@ -84,7 +98,7 @@ st.markdown(
         border:1px solid #91d5ff;
         border-radius:12px;
         padding:14px 16px;
-        min-height:150px;
+        min-height:180px;
         background:#f0f9ff;
         box-shadow:0 1px 2px rgba(0,0,0,.04);
         color:#111827;
@@ -196,7 +210,6 @@ st.markdown(
 # 基礎工具
 # =============================================================================
 def get_secret_or_default(key: str, default: str = ""):
-    """安全讀取 Streamlit Secrets；未設定時回傳預設值。"""
     try:
         return st.secrets.get(key, default)
     except Exception:
@@ -208,19 +221,16 @@ def symbol_to_code(symbol: str) -> str:
 
 
 def yahoo_quote_url(symbol: str) -> str:
-    """產生 Yahoo 台股個股頁連結。"""
     code = symbol_to_code(symbol)
     return f"https://tw.stock.yahoo.com/quote/{code}"
 
 
 def make_anchor_id(group_name: str) -> str:
-    """將分類名稱轉成穩定的 HTML 錨點 ID，讓儀表板卡片可跳到對應表格。"""
     anchor = re.sub(r"[^0-9A-Za-z一-鿿]+", "-", str(group_name)).strip("-")
     return f"group-{anchor or 'default'}"
 
 
 def format_price_value(value):
-    """格式化富邦 WebSocket 即時價。"""
     if value is None:
         return "-"
     try:
@@ -241,6 +251,27 @@ def format_pct_value(value):
     if pct < 0:
         return f"🟢 {pct:.2f}%"
     return "⚪ 0.00%"
+
+
+def format_signed_pct(value):
+    if value is None:
+        return "-"
+    try:
+        value = float(value)
+    except Exception:
+        return "-"
+    if value > 0:
+        return f"+{value:.2f}%"
+    return f"{value:.2f}%"
+
+
+def format_ratio_value(value):
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.2f}x"
+    except Exception:
+        return "-"
 
 
 def pct_class(value):
@@ -350,7 +381,6 @@ def save_yf_close_cache(cache: dict):
 
 
 def get_yfinance_yesterday_close(symbol: str):
-    """取得昨日/前一交易日收盤價；一小時內讀本地 JSON 快取，超過才重新抓 yfinance。"""
     code = symbol_to_code(symbol)
     now_ts = time.time()
     cache = load_yf_close_cache()
@@ -437,7 +467,7 @@ def get_yfinance_yesterday_close(symbol: str):
 
 
 # =============================================================================
-# 股票名稱 / 查詢：只讀本地 TWstocklistname.txt
+# 股票名稱 / 查詢
 # =============================================================================
 @st.cache_data(ttl=86400)
 def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
@@ -724,7 +754,6 @@ class FubonRealtimeManager:
         return None
 
     def _extract_cumulative_volume(self, msg):
-        """讀取富邦 trades 的累積成交量欄位。"""
         data = msg.get("data", {})
 
         if not isinstance(data, dict):
@@ -755,7 +784,6 @@ class FubonRealtimeManager:
         return None
 
     def _extract_tick_size(self, msg):
-        """讀取富邦 trades 的單筆成交量欄位；size 才是單筆，volume 多半是盤中累積量。"""
         data = msg.get("data", {})
 
         if not isinstance(data, dict):
@@ -813,7 +841,6 @@ class FubonRealtimeManager:
         if raw_upper in ["SELL", "S", "ASK", "內盤", "內盤(賣)", "賣", "2"]:
             return "內盤(賣)"
 
-        # 若未提供內外盤欄位，嘗試用成交價與買一 / 賣一判斷。
         if price is not None:
             bid = self._safe_float(
                 data.get("bid")
@@ -868,14 +895,23 @@ class FubonRealtimeManager:
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
                 "recent_ticks": [],
+                "price_points": [],
             })
 
             if price is not None:
                 status["last_ws_price"] = price
 
-            # 最新單筆量：
-            # 1. 優先使用 size / tradeSize 等單筆欄位。
-            # 2. 若沒有 size，才用本次累積量 - 上次累積量換算。
+                price_points = status.get("price_points", [])
+                price_points.append({
+                    "time": now,
+                    "price": float(price),
+                })
+                status["price_points"] = [
+                    p for p in price_points
+                    if hasattr(p.get("time"), "timestamp")
+                    and (now - p.get("time")).total_seconds() <= 300
+                ][-1000:]
+
             tick_volume = None
 
             if direct_tick_size is not None:
@@ -895,7 +931,6 @@ class FubonRealtimeManager:
                     elif diff == 0:
                         tick_volume = 0
                     else:
-                        # 可能跨日、重連或資料重置，不使用負數。
                         tick_volume = None
 
                 status["last_cumulative_volume"] = int(cumulative_volume)
@@ -922,7 +957,11 @@ class FubonRealtimeManager:
 
                 recent_ticks = status.get("recent_ticks", [])
                 recent_ticks.append(tick)
-                status["recent_ticks"] = recent_ticks[-200:]
+                status["recent_ticks"] = [
+                    t for t in recent_ticks
+                    if hasattr(t.get("time"), "timestamp")
+                    and (now - t.get("time")).total_seconds() <= 300
+                ][-1000:]
 
             self.tick_status[symbol] = status
 
@@ -971,7 +1010,229 @@ class FubonRealtimeManager:
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
                 "recent_ticks": [],
+                "price_points": [],
             }))
+
+    def get_volume_price_signal(
+        self,
+        symbol: str,
+        window_sec: int = DEFAULT_SIGNAL_WINDOW_SEC,
+        track_sec: int = DEFAULT_SIGNAL_TRACK_SEC,
+        volume_ratio_threshold: float = DEFAULT_SIGNAL_VOLUME_RATIO,
+        price_move_pct: float = DEFAULT_SIGNAL_PRICE_MOVE_PCT,
+    ):
+        code = symbol_to_code(symbol)
+
+        try:
+            window_sec = max(5, int(window_sec))
+        except Exception:
+            window_sec = DEFAULT_SIGNAL_WINDOW_SEC
+
+        try:
+            track_sec = max(window_sec, int(track_sec))
+        except Exception:
+            track_sec = DEFAULT_SIGNAL_TRACK_SEC
+
+        try:
+            volume_ratio_threshold = max(0.1, float(volume_ratio_threshold))
+        except Exception:
+            volume_ratio_threshold = DEFAULT_SIGNAL_VOLUME_RATIO
+
+        try:
+            price_move_pct = max(0.1, float(price_move_pct))
+        except Exception:
+            price_move_pct = DEFAULT_SIGNAL_PRICE_MOVE_PCT
+
+        now = datetime.now(TW_TZ)
+        now_ts = now.timestamp()
+        bucket_id = int(now_ts // window_sec)
+
+        with self.lock:
+            status = copy.deepcopy(self.tick_status.get(code, {
+                "last_ws_price": None,
+                "recent_ticks": [],
+                "price_points": [],
+            }))
+
+        current_price = status.get("last_ws_price")
+        recent_ticks = status.get("recent_ticks", [])
+        price_points = status.get("price_points", [])
+
+        current_window_ticks = []
+        previous_window_ticks = []
+
+        for tick in recent_ticks:
+            tick_time = tick.get("time")
+            if not hasattr(tick_time, "timestamp"):
+                continue
+
+            age_sec = (now - tick_time).total_seconds()
+
+            volume = 0
+            try:
+                volume = int(tick.get("volume") or 0)
+            except Exception:
+                volume = 0
+
+            if 0 <= age_sec <= window_sec:
+                current_window_ticks.append(tick)
+            elif window_sec < age_sec <= window_sec * 2:
+                previous_window_ticks.append(tick)
+
+        current_volume = sum(int(t.get("volume") or 0) for t in current_window_ticks)
+        previous_volume = sum(int(t.get("volume") or 0) for t in previous_window_ticks)
+
+        volume_ratio = None
+        volume_ok = False
+
+        if previous_volume > 0:
+            volume_ratio = current_volume / previous_volume
+            volume_ok = volume_ratio >= volume_ratio_threshold
+
+        current_window_prices = []
+
+        for point in price_points:
+            point_time = point.get("time")
+            point_price = self._safe_float(point.get("price"))
+
+            if not hasattr(point_time, "timestamp") or point_price is None or point_price <= 0:
+                continue
+
+            age_sec = (now - point_time).total_seconds()
+
+            if 0 <= age_sec <= window_sec:
+                current_window_prices.append(point)
+
+        current_window_prices.sort(key=lambda x: x.get("time"))
+
+        start_30_price = None
+        price_change_30_pct = None
+
+        if current_window_prices:
+            start_30_price = self._safe_float(current_window_prices[0].get("price"))
+
+        if (
+            current_price is not None
+            and start_30_price is not None
+            and start_30_price > 0
+        ):
+            price_change_30_pct = (float(current_price) / float(start_30_price) - 1) * 100
+
+        track_prices = []
+
+        for point in price_points:
+            point_time = point.get("time")
+            point_price = self._safe_float(point.get("price"))
+
+            if not hasattr(point_time, "timestamp") or point_price is None or point_price <= 0:
+                continue
+
+            age_sec = (now - point_time).total_seconds()
+
+            if 0 <= age_sec <= track_sec:
+                track_prices.append(point_price)
+
+        low_1m = min(track_prices) if track_prices else None
+        high_1m = max(track_prices) if track_prices else None
+
+        rise_from_low_pct = None
+        drop_from_high_pct = None
+
+        if current_price is not None and low_1m is not None and low_1m > 0:
+            rise_from_low_pct = (float(current_price) / float(low_1m) - 1) * 100
+
+        if current_price is not None and high_1m is not None and high_1m > 0:
+            drop_from_high_pct = (float(current_price) / float(high_1m) - 1) * 100
+
+        condition1_up = (
+            volume_ok
+            and price_change_30_pct is not None
+            and price_change_30_pct >= price_move_pct
+        )
+
+        condition1_down = (
+            volume_ok
+            and price_change_30_pct is not None
+            and price_change_30_pct <= -price_move_pct
+        )
+
+        condition2_up = (
+            volume_ok
+            and rise_from_low_pct is not None
+            and rise_from_low_pct >= price_move_pct
+        )
+
+        condition2_down = (
+            volume_ok
+            and drop_from_high_pct is not None
+            and drop_from_high_pct <= -price_move_pct
+        )
+
+        active_conditions = []
+
+        if condition1_up:
+            active_conditions.append("條件1急拉")
+        if condition1_down:
+            active_conditions.append("條件1急殺")
+        if condition2_up:
+            active_conditions.append("條件2低點拉抬")
+        if condition2_down:
+            active_conditions.append("條件2高點下跌")
+
+        active = len(active_conditions) > 0
+
+        direction = "-"
+        if condition1_up or condition2_up:
+            direction = "拉抬"
+        elif condition1_down or condition2_down:
+            direction = "下跌"
+
+        if active:
+            icon = "🚀" if direction == "拉抬" else "📉"
+            text = (
+                f"{icon} {direction}訊號｜"
+                f"{'、'.join(active_conditions)}｜"
+                f"本30秒量 {current_volume} / 前30秒量 {previous_volume}｜"
+                f"量比 {format_ratio_value(volume_ratio)}｜"
+                f"30秒變化 {format_signed_pct(price_change_30_pct)}｜"
+                f"1分低點拉抬 {format_signed_pct(rise_from_low_pct)}｜"
+                f"1分高點變化 {format_signed_pct(drop_from_high_pct)}"
+            )
+        else:
+            text = "監控中"
+
+        signal_key = (
+            f"{code}_{bucket_id}_{direction}_"
+            f"{'_'.join(active_conditions)}_"
+            f"cv{current_volume}_pv{previous_volume}_"
+            f"p{current_price}"
+        )
+
+        return {
+            "active": bool(active),
+            "code": code,
+            "time": now,
+            "bucket_id": bucket_id,
+            "direction": direction,
+            "conditions": active_conditions,
+            "text": text,
+            "current_price": current_price,
+            "current_volume": int(current_volume),
+            "previous_volume": int(previous_volume),
+            "volume_ratio": volume_ratio,
+            "volume_ok": bool(volume_ok),
+            "start_30_price": start_30_price,
+            "price_change_30_pct": price_change_30_pct,
+            "low_1m": low_1m,
+            "high_1m": high_1m,
+            "rise_from_low_pct": rise_from_low_pct,
+            "drop_from_high_pct": drop_from_high_pct,
+            "signal_key": signal_key,
+            "window_sec": window_sec,
+            "track_sec": track_sec,
+            "volume_ratio_threshold": volume_ratio_threshold,
+            "price_move_pct": price_move_pct,
+        }
 
     def get_status(self):
         with self.lock:
@@ -1030,6 +1291,18 @@ if "auto_refresh_enabled" not in st.session_state:
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 
+if "signal_window_sec" not in st.session_state:
+    st.session_state.signal_window_sec = DEFAULT_SIGNAL_WINDOW_SEC
+
+if "signal_track_sec" not in st.session_state:
+    st.session_state.signal_track_sec = DEFAULT_SIGNAL_TRACK_SEC
+
+if "signal_volume_ratio" not in st.session_state:
+    st.session_state.signal_volume_ratio = DEFAULT_SIGNAL_VOLUME_RATIO
+
+if "signal_price_move_pct" not in st.session_state:
+    st.session_state.signal_price_move_pct = DEFAULT_SIGNAL_PRICE_MOVE_PCT
+
 if "stock_groups" not in st.session_state:
     st.session_state.stock_groups = load_stock_groups()
 
@@ -1059,11 +1332,54 @@ if "fubon_manager" not in st.session_state:
 if "fubon_logged_in" not in st.session_state:
     st.session_state.fubon_logged_in = False
 
+if "signal_toast_keys" not in st.session_state:
+    st.session_state.signal_toast_keys = set()
+
+if "_signal_toast_messages" not in st.session_state:
+    st.session_state._signal_toast_messages = []
+
 
 def show_pending_toasts():
     if "_quick_add_success_message" in st.session_state:
         st.toast(st.session_state._quick_add_success_message, duration="long")
         del st.session_state._quick_add_success_message
+
+    messages = st.session_state.get("_signal_toast_messages", [])
+    if messages:
+        for msg in messages[-5:]:
+            st.toast(msg, icon="🚨", duration="long")
+        st.session_state._signal_toast_messages = []
+
+
+def queue_signal_toast(group_name, code, stock_name, signal, change_pct):
+    if not signal or not signal.get("active"):
+        return
+
+    signal_key = signal.get("signal_key")
+
+    if not signal_key:
+        return
+
+    if signal_key in st.session_state.signal_toast_keys:
+        return
+
+    signal_time = signal.get("time")
+    time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
+    current_price = signal.get("current_price")
+    price_text = format_price_value(current_price)
+
+    msg = (
+        f"🚨 量價異常訊號\n"
+        f"{group_name}｜{code} {stock_name}\n"
+        f"{signal.get('text')}\n"
+        f"現價：{price_text}｜漲幅：{format_pct_value(change_pct)}｜時間：{time_text}"
+    )
+
+    st.session_state._signal_toast_messages.append(msg)
+    st.session_state.signal_toast_keys.add(signal_key)
+
+    if len(st.session_state.signal_toast_keys) > 500:
+        st.session_state.signal_toast_keys = set(list(st.session_state.signal_toast_keys)[-300:])
 
 
 show_pending_toasts()
@@ -1133,6 +1449,7 @@ def render_fubon_login():
         with c1:
             if st.button("盤中累積歸零", width="stretch"):
                 manager.reset_runtime_data()
+                st.session_state.signal_toast_keys = set()
                 st.rerun()
 
         with c2:
@@ -1423,7 +1740,9 @@ else:
     st.markdown("## ⚡ 盤中即時成交監控")
 
 
-control_col1, control_col2, control_col3, control_col4 = st.columns([1, 1, 1, 1])
+control_col1, control_col2, control_col3, control_col4, control_col5, control_col6, control_col7, control_col8 = st.columns(
+    [1, 1, 1, 1, 1, 1, 1, 1]
+)
 
 with control_col1:
     if st.button("🔄 手動刷新畫面", width="stretch"):
@@ -1448,6 +1767,46 @@ with control_col4:
         max_value=10.0,
         value=5.0,
         step=0.5,
+    )
+
+with control_col5:
+    st.number_input(
+        "量能視窗秒數",
+        min_value=5,
+        max_value=120,
+        step=5,
+        key="signal_window_sec",
+        help="預設 30 秒；用來比較目前視窗成交量與上一個視窗成交量。",
+    )
+
+with control_col6:
+    st.number_input(
+        "追蹤高低點秒數",
+        min_value=10,
+        max_value=300,
+        step=10,
+        key="signal_track_sec",
+        help="預設 60 秒；用來追蹤最近一分鐘低點 / 高點。",
+    )
+
+with control_col7:
+    st.number_input(
+        "量比門檻",
+        min_value=0.1,
+        max_value=10.0,
+        step=0.1,
+        key="signal_volume_ratio",
+        help="預設 1.3；目前 30 秒成交量需大於上一個 30 秒成交量的 1.3 倍。",
+    )
+
+with control_col8:
+    st.number_input(
+        "價格變動門檻 (%)",
+        min_value=0.1,
+        max_value=10.0,
+        step=0.1,
+        key="signal_price_move_pct",
+        help="預設 2%；符合拉抬或下跌幅度時發出訊號。",
     )
 
 
@@ -1503,7 +1862,10 @@ st.info(
 )
 
 st.caption(
-    "✅ 目前版本已移除所有大單判定、大單提醒、秒級拉抬與 Telegram 推送邏輯。"
+    f"✅ 量價訊號條件："
+    f"目前 {int(st.session_state.signal_window_sec)} 秒成交量 > 上一個 {int(st.session_state.signal_window_sec)} 秒成交量 × {float(st.session_state.signal_volume_ratio):.1f}，"
+    f"且 30 秒內價格變化 ≥ ±{float(st.session_state.signal_price_move_pct):.1f}% "
+    f"或最近 {int(st.session_state.signal_track_sec)} 秒高低點反彈 / 回落 ≥ ±{float(st.session_state.signal_price_move_pct):.1f}%。"
 )
 
 
@@ -1512,6 +1874,8 @@ st.caption(
 # =============================================================================
 group_tables = {}
 dashboard_items = []
+recent_signals = []
+
 yf_source_count = {
     "yfinance": 0,
     "cache": 0,
@@ -1525,7 +1889,9 @@ for group_name, stocks in st.session_state.stock_groups.items():
     known_pct_count = 0
     up_count = 0
     down_count = 0
+    signal_count = 0
     top_pct_items = []
+    group_signal_messages = []
 
     for symbol in stocks:
         code = symbol_to_code(symbol)
@@ -1538,6 +1904,14 @@ for group_name, stocks in st.session_state.stock_groups.items():
         trade_type = tick_status.get("last_trade_type", "-")
         total_buy_vol = int(tick_status.get("total_buy_vol", 0) or 0)
         total_sell_vol = int(tick_status.get("total_sell_vol", 0) or 0)
+
+        signal = manager.get_volume_price_signal(
+            symbol,
+            window_sec=st.session_state.signal_window_sec,
+            track_sec=st.session_state.signal_track_sec,
+            volume_ratio_threshold=st.session_state.signal_volume_ratio,
+            price_move_pct=st.session_state.signal_price_move_pct,
+        ) if manager is not None else {"active": False, "text": "監控中"}
 
         yesterday_close, close_date, yf_source = get_yfinance_yesterday_close(symbol)
 
@@ -1568,15 +1942,42 @@ for group_name, stocks in st.session_state.stock_groups.items():
             if float(change_pct) >= float(pct_threshold):
                 pct_hit_count += 1
 
+        if signal.get("active"):
+            signal_count += 1
+
+            signal_msg = {
+                "group": group_name,
+                "code": code,
+                "name": stock_name,
+                "text": signal.get("text", ""),
+                "time": signal.get("time"),
+                "pct": change_pct,
+                "direction": signal.get("direction", "-"),
+            }
+
+            group_signal_messages.append(signal_msg)
+            recent_signals.append(signal_msg)
+
+            queue_signal_toast(group_name, code, stock_name, signal, change_pct)
+
         rows.append({
             "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
+            "量價訊號": signal.get("text", "監控中"),
             "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
             "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
             "內外盤": trade_type,
             "外盤累積": total_buy_vol,
             "內盤累積": total_sell_vol,
+            "本30秒量": signal.get("current_volume", 0),
+            "前30秒量": signal.get("previous_volume", 0),
+            "30秒量比": format_ratio_value(signal.get("volume_ratio")),
+            "30秒價格變化": format_signed_pct(signal.get("price_change_30_pct")),
+            "1分低點": format_price_value(signal.get("low_1m")),
+            "1分高點": format_price_value(signal.get("high_1m")),
+            "1分低點拉抬": format_signed_pct(signal.get("rise_from_low_pct")),
+            "1分高點下跌": format_signed_pct(signal.get("drop_from_high_pct")),
             "昨收日期": close_date or "-",
             "昨收來源": yf_source,
         })
@@ -1592,6 +1993,16 @@ for group_name, stocks in st.session_state.stock_groups.items():
         for item in top_pct_items[:3]
     ]) or "尚無漲幅資料"
 
+    group_signal_messages.sort(
+        key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ),
+        reverse=True,
+    )
+
+    signal_text = "<br>".join([
+        f'▸ {escape_html(item["code"])} {escape_html(item["name"])}：{escape_html(item["text"])}'
+        for item in group_signal_messages[:3]
+    ]) or "尚無訊號"
+
     pct_hit_ratio = (pct_hit_count / len(stocks) * 100) if len(stocks) else 0
 
     dashboard_items.append({
@@ -1602,7 +2013,9 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "pct_hit_ratio": pct_hit_ratio,
         "up_count": up_count,
         "down_count": down_count,
+        "signal_count": signal_count,
         "top_pct_text": top_pct_text,
+        "signal_text": signal_text,
     })
 
     group_tables[group_name] = pd.DataFrame(
@@ -1610,16 +2023,28 @@ for group_name, stocks in st.session_state.stock_groups.items():
         columns=[
             "代碼",
             "股票名稱",
+            "量價訊號",
             "即時價",
             "漲幅%",
             "最新單筆",
             "內外盤",
             "外盤累積",
             "內盤累積",
+            "本30秒量",
+            "前30秒量",
+            "30秒量比",
+            "30秒價格變化",
+            "1分低點",
+            "1分高點",
+            "1分低點拉抬",
+            "1分高點下跌",
             "昨收日期",
             "昨收來源",
         ],
     )
+
+
+show_pending_toasts()
 
 
 # =============================================================================
@@ -1630,10 +2055,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("### 📌 即時漲幅儀表板")
+st.markdown("### 📌 量價訊號儀表板")
 
 st.caption(
     f"漲幅達標門檻：≥ {pct_threshold:.1f}%｜"
+    f"量能視窗：{int(st.session_state.signal_window_sec)} 秒｜"
+    f"量比門檻：{float(st.session_state.signal_volume_ratio):.1f}x｜"
+    f"價格變動門檻：±{float(st.session_state.signal_price_move_pct):.1f}%｜"
+    f"高低點追蹤：{int(st.session_state.signal_track_sec)} 秒｜"
     f"yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC // 60} 分鐘"
 )
 
@@ -1645,13 +2074,14 @@ st.caption(
     f"缺資料 {yf_source_count['missing']} 檔"
 )
 
-
 card_html_parts = ['<div class="dashboard-grid">']
 
 for item in dashboard_items:
     pct_ratio = float(item.get("pct_hit_ratio", 0) or 0)
 
-    if pct_ratio >= 70:
+    if item.get("signal_count", 0) > 0:
+        card_class = "dash-card pct-high"
+    elif pct_ratio >= 70:
         card_class = "dash-card pct-high"
     elif pct_ratio >= 40:
         card_class = "dash-card pct-mid"
@@ -1663,16 +2093,15 @@ for item in dashboard_items:
     anchor_id = make_anchor_id(item["group"])
 
     card_html_parts.append(
-        f'#{anchor_id} 明細表；大數字 = 漲幅達標檔數 / 分組總檔數">'
+        f'#{anchor_id} 明細表">'
         f'<div class="{card_class}">'
         f'<div class="dash-title">{escape_html(item["group"])}</div>'
-        f'<div class="dash-big">{item["pct_hit_count"]} / {item["total"]}</div>'
-        f'<div class="dash-line">漲幅達標比例（≥{pct_threshold:.1f}%）：'
-        f'<b>{item["pct_hit_ratio"]:.0f}%</b></div>'
-        f'<div class="dash-line">🎯 達標：<b>{item["pct_hit_count"]}</b> 檔'
-        f'（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
-        f'<div class="dash-line">🔴 一般上漲：<b>{item["up_count"]}</b>　'
+        f'<div class="dash-big">訊號 {item["signal_count"]} 檔</div>'
+        f'<div class="dash-line">漲幅達標（≥{pct_threshold:.1f}%）：'
+        f'<b>{item["pct_hit_count"]} / {item["total"]}</b>，比例 <b>{item["pct_hit_ratio"]:.0f}%</b></div>'
+        f'<div class="dash-line">🔴 上漲：<b>{item["up_count"]}</b>　'
         f'🟢 下跌：<b>{item["down_count"]}</b></div>'
+        f'<div class="dash-small"><b>最新量價訊號</b><br>{item["signal_text"]}</div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
         f'</div></a>'
     )
@@ -1680,6 +2109,25 @@ for item in dashboard_items:
 card_html_parts.append("</div>")
 
 st.markdown("".join(card_html_parts), unsafe_allow_html=True)
+
+
+recent_signals.sort(
+    key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ),
+    reverse=True,
+)
+
+st.caption(f"本輪掃到量價訊號：{len(recent_signals)} 檔")
+
+if recent_signals:
+    st.markdown("#### 🚨 最近量價訊號")
+    recent_cols = st.columns(min(3, len(recent_signals)))
+
+    for idx, item in enumerate(recent_signals[:6]):
+        with recent_cols[idx % len(recent_cols)]:
+            st.warning(
+                f"{item['group']}｜{item['code']} {item['name']}\n\n"
+                f"{item['text']}"
+            )
 
 st.divider()
 
@@ -1719,6 +2167,10 @@ for group_name, display_df in group_tables.items():
                 display_text=r"https://tw.stock.yahoo.com/quote/(.*)",
             ),
             "股票名稱": st.column_config.TextColumn("股票名稱"),
+            "量價訊號": st.column_config.TextColumn(
+                "量價訊號",
+                help="條件1：30秒量比放大且30秒內漲跌達門檻；條件2：30秒量比放大且1分鐘高低點突破達門檻。",
+            ),
             "即時價": st.column_config.TextColumn(
                 "即時價",
                 help="由富邦 WebSocket trades 即時成交價取得",
@@ -1734,6 +2186,14 @@ for group_name, display_df in group_tables.items():
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
             "內盤累積": st.column_config.NumberColumn("內盤累積"),
+            "本30秒量": st.column_config.NumberColumn("本30秒量"),
+            "前30秒量": st.column_config.NumberColumn("前30秒量"),
+            "30秒量比": st.column_config.TextColumn("30秒量比"),
+            "30秒價格變化": st.column_config.TextColumn("30秒價格變化"),
+            "1分低點": st.column_config.TextColumn("1分低點"),
+            "1分高點": st.column_config.TextColumn("1分高點"),
+            "1分低點拉抬": st.column_config.TextColumn("1分低點拉抬"),
+            "1分高點下跌": st.column_config.TextColumn("1分高點下跌"),
             "昨收日期": st.column_config.TextColumn("昨收日期"),
             "昨收來源": st.column_config.TextColumn("昨收來源"),
         },
