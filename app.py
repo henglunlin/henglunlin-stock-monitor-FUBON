@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-盤中大單進出監控 - 純富邦 WebSocket 版
+盤中即時成交監控 - 純富邦 WebSocket 版
 
 重點：
-1. 富邦 WebSocket 負責盤中大單、單筆量、內外盤。
+1. 富邦 WebSocket 負責盤中即時價、單筆量、內外盤。
 2. yfinance 只用來抓「昨日收盤價」，一小時更新一次，並存入本地 JSON 歷史快取。
-3. 表格顯示：代碼 Yahoo 連結｜股票名稱｜大單追蹤｜即時價｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
-4. 修正「最新單筆」：富邦 trades 回傳的 volume 常是盤中累積量，本版會用「本次累積量 - 上次累積量」換算單筆增量。
+3. 表格顯示：代碼 Yahoo 連結｜股票名稱｜即時價｜漲幅%｜最新單筆｜內外盤｜外盤累積｜內盤累積。
+4. 已移除所有「大單判定」、「大單提醒」、「秒級拉抬」、「Telegram 推播」相關邏輯。
 """
 
 import os
@@ -17,7 +17,6 @@ import time
 import base64
 import tempfile
 import threading
-import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -34,7 +33,8 @@ try:
 except Exception:
     yf = None
 
-st.set_page_config(page_title="盤中大單進出監控", layout="wide")
+
+st.set_page_config(page_title="盤中即時成交監控", layout="wide")
 
 TW_TZ = ZoneInfo("Asia/Taipei")
 GROUP_EDIT_PIN = "1219"
@@ -43,25 +43,8 @@ BACKUP_DIR = "backups"
 STOCK_NAME_FILE = "TWstocklistname.txt"
 APP_LOGO = "jerry.jpg"
 
-
-def get_secret_or_default(key: str, default: str = ""):
-    """安全讀取 Streamlit Secrets；未設定時回傳預設值。"""
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
-
-
-# ===== Telegram 設定 =====
-TELEGRAM_BOT_TOKEN = get_secret_or_default("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
-
 YF_CLOSE_CACHE_FILE = "yf_yesterday_close_cache.json"
 YF_CLOSE_CACHE_TTL_SEC = 3600
-DEFAULT_LARGE_ORDER_THRESHOLD = 5  # 單筆大單門檻；之後以 UI 即時值為準
-DEFAULT_MOMENTUM_CUMULATIVE_THRESHOLD = 20  # 拉抬訊號：視窗內外盤大單累積張數門檻
-DEFAULT_MOMENTUM_WINDOW_SEC = 10  # 拉抬訊號：觀察秒數
-DEFAULT_MOMENTUM_PRICE_PCT = 2.0  # 拉抬訊號：視窗內價格拉抬百分比
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -74,43 +57,152 @@ DEFAULT_STOCK_GROUPS = {
     ],
 }
 
+
 st.markdown(
     """
     <style>
     html { scroll-behavior: smooth; }
-    .dashboard-link, .dashboard-link:link, .dashboard-link:visited, .dashboard-link:hover, .dashboard-link:active { text-decoration:none !important; color:inherit !important; display:block; }
-    .dash-card { cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; }
-    .dash-card:hover { transform:translateY(-2px); box-shadow:0 4px 10px rgba(0,0,0,.18); }
-    .dashboard-grid {display:grid; grid-template-columns:repeat(4,minmax(240px,1fr)); gap:12px; margin:10px 0 18px 0;}
-    .dash-card {border:1px solid #91d5ff; border-radius:12px; padding:14px 16px; min-height:190px; background:#f0f9ff; box-shadow:0 1px 2px rgba(0,0,0,.04); color:#111827;}
-    /* 儀表板顏色依「漲幅達標比例」分級：0%、1~39%、40~69%、70%以上 */
-    .dash-card.pct-zero {border-color:#d9d9d9; background:#fafafa; color:#374151;}
-    .dash-card.pct-low {border-color:#91d5ff; background:#f0f9ff; color:#111827;}
-    .dash-card.pct-mid {border-color:#ffd666; background:#fffbe6; color:#111827;}
-    .dash-card.pct-high {border-color:#ff7875; background:#fff1f0; color:#111827; box-shadow:0 1px 8px rgba(207,19,34,.18);}
-    .dash-card.hot {border-color:#ff9c6e; background:#fff7e6; color:#111827;}
-    .dash-card.strong {border-color:#95de64; background:#f6ffed; color:#111827;}
-    .dash-title {font-weight:800; font-size:18px; margin-bottom:8px; color:#111827;}
-    .dash-big {font-size:30px; font-weight:900; margin:4px 0 10px 0; color:#111827 !important; text-shadow:none; letter-spacing:.3px;}
-    .dash-card.pct-zero .dash-big {color:#374151 !important;}
-    .dash-card.pct-low .dash-big {color:#0f172a !important;}
-    .dash-card.pct-mid .dash-big {color:#7a4e00 !important;}
-    .dash-card.pct-high .dash-big {color:#b91c1c !important; text-shadow:0 1px 1px rgba(255,255,255,.65);}
-    .dash-line {font-size:14px; line-height:1.65; color:#111827;}
-    .dash-small {font-size:12px; color:#374151; margin-top:8px; border-top:1px solid rgba(0,0,0,.10); padding-top:8px;}
-    .dash-card.pct-high .dash-small, .dash-card.pct-high .dash-line, .dash-card.pct-high .dash-title {color:#111827;}
-    .dash-card.pct-mid .dash-small, .dash-card.pct-mid .dash-line, .dash-card.pct-mid .dash-title {color:#111827;}
-    .up-text {color:#cf1322; font-weight:700;} .down-text {color:#389e0d; font-weight:700;} .flat-text {color:#6b7280; font-weight:700;}
-    @media (max-width:1200px){.dashboard-grid{grid-template-columns:repeat(2,minmax(240px,1fr));}}
-    @media (max-width:700px){.dashboard-grid{grid-template-columns:1fr;}}
+
+    .dashboard-link,
+    .dashboard-link:link,
+    .dashboard-link:visited,
+    .dashboard-link:hover,
+    .dashboard-link:active {
+        text-decoration:none !important;
+        color:inherit !important;
+        display:block;
+    }
+
+    .dashboard-grid {
+        display:grid;
+        grid-template-columns:repeat(4,minmax(240px,1fr));
+        gap:12px;
+        margin:10px 0 18px 0;
+    }
+
+    .dash-card {
+        border:1px solid #91d5ff;
+        border-radius:12px;
+        padding:14px 16px;
+        min-height:150px;
+        background:#f0f9ff;
+        box-shadow:0 1px 2px rgba(0,0,0,.04);
+        color:#111827;
+        cursor:pointer;
+        transition:transform .12s ease, box-shadow .12s ease;
+    }
+
+    .dash-card:hover {
+        transform:translateY(-2px);
+        box-shadow:0 4px 10px rgba(0,0,0,.18);
+    }
+
+    .dash-card.pct-zero {
+        border-color:#d9d9d9;
+        background:#fafafa;
+        color:#374151;
+    }
+
+    .dash-card.pct-low {
+        border-color:#91d5ff;
+        background:#f0f9ff;
+        color:#111827;
+    }
+
+    .dash-card.pct-mid {
+        border-color:#ffd666;
+        background:#fffbe6;
+        color:#111827;
+    }
+
+    .dash-card.pct-high {
+        border-color:#ff7875;
+        background:#fff1f0;
+        color:#111827;
+        box-shadow:0 1px 8px rgba(207,19,34,.18);
+    }
+
+    .dash-title {
+        font-weight:800;
+        font-size:18px;
+        margin-bottom:8px;
+        color:#111827;
+    }
+
+    .dash-big {
+        font-size:30px;
+        font-weight:900;
+        margin:4px 0 10px 0;
+        color:#111827 !important;
+        text-shadow:none;
+        letter-spacing:.3px;
+    }
+
+    .dash-card.pct-zero .dash-big { color:#374151 !important; }
+    .dash-card.pct-low .dash-big { color:#0f172a !important; }
+    .dash-card.pct-mid .dash-big { color:#7a4e00 !important; }
+    .dash-card.pct-high .dash-big {
+        color:#b91c1c !important;
+        text-shadow:0 1px 1px rgba(255,255,255,.65);
+    }
+
+    .dash-line {
+        font-size:14px;
+        line-height:1.65;
+        color:#111827;
+    }
+
+    .dash-small {
+        font-size:12px;
+        color:#374151;
+        margin-top:8px;
+        border-top:1px solid rgba(0,0,0,.10);
+        padding-top:8px;
+    }
+
+    .up-text {
+        color:#cf1322;
+        font-weight:700;
+    }
+
+    .down-text {
+        color:#389e0d;
+        font-weight:700;
+    }
+
+    .flat-text {
+        color:#6b7280;
+        font-weight:700;
+    }
+
+    @media (max-width:1200px) {
+        .dashboard-grid {
+            grid-template-columns:repeat(2,minmax(240px,1fr));
+        }
+    }
+
+    @media (max-width:700px) {
+        .dashboard-grid {
+            grid-template-columns:1fr;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+
 # =============================================================================
 # 基礎工具
 # =============================================================================
+def get_secret_or_default(key: str, default: str = ""):
+    """安全讀取 Streamlit Secrets；未設定時回傳預設值。"""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
 def symbol_to_code(symbol: str) -> str:
     return str(symbol).strip().upper().split(".")[0]
 
@@ -166,26 +258,75 @@ def pct_class(value):
 
 
 def escape_html(text_value):
-    return str(text_value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    return (
+        str(text_value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def normalize_symbol_quick(input_text: str):
+    s = str(input_text).strip().upper()
+    if not s:
+        return None
+    if "." in s:
+        return s
+    if s.isdigit():
+        if s.startswith(("3", "6", "8")):
+            return f"{s}.TWO"
+        return f"{s}.TW"
+    return s
+
+
+def normalize_symbols_from_text(text: str):
+    if not text:
+        return []
+
+    text = text.replace("，", ",")
+    items = []
+
+    for raw_line in text.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        items.extend([p.strip().upper() for p in raw_line.split(",") if p.strip()])
+
+    result, seen = [], set()
+
+    for item in items:
+        symbol = normalize_symbol_quick(item)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            result.append(symbol)
+
+    return result
 
 
 def build_yfinance_candidates(symbol: str):
     raw = str(symbol).strip().upper()
     code = symbol_to_code(raw)
+
     candidates = []
+
     if raw and "." in raw:
         candidates.append(raw)
     elif raw:
         normalized = normalize_symbol_quick(raw)
         if normalized:
             candidates.append(normalized)
+
     if code:
         candidates.extend([f"{code}.TW", f"{code}.TWO"])
+
     result, seen = [], set()
+
     for item in candidates:
         if item and item not in seen:
             seen.add(item)
             result.append(item)
+
     return result
 
 
@@ -228,71 +369,71 @@ def get_yfinance_yesterday_close(symbol: str):
 
     last_error = ""
     today = datetime.now(TW_TZ).date()
+
     for yf_symbol in build_yfinance_candidates(symbol):
         try:
-            df = yf.download(yf_symbol, period="10d", interval="1d", auto_adjust=False, progress=False, threads=False)
+            df = yf.download(
+                yf_symbol,
+                period="10d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+
             if df is None or df.empty:
                 last_error = f"{yf_symbol}: no data"
                 continue
+
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
             df = df.reset_index()
-            date_col = "Date" if "Date" in df.columns else "Datetime" if "Datetime" in df.columns else df.columns[0]
+
+            if "Date" in df.columns:
+                date_col = "Date"
+            elif "Datetime" in df.columns:
+                date_col = "Datetime"
+            else:
+                date_col = df.columns[0]
+
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             df = df.dropna(subset=[date_col])
             df = df[df[date_col].dt.date < today].sort_values(date_col)
+
             if df.empty or "Close" not in df.columns:
                 last_error = f"{yf_symbol}: no previous close"
                 continue
+
             close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+
             if close.empty:
                 last_error = f"{yf_symbol}: close empty"
                 continue
+
             close_value = float(close.iloc[-1])
             close_date = pd.to_datetime(df.loc[close.index[-1], date_col]).date().isoformat()
-            cache[code] = {"symbol": yf_symbol, "close": close_value, "date": close_date, "fetched_at": now_ts, "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")}
+
+            cache[code] = {
+                "symbol": yf_symbol,
+                "close": close_value,
+                "date": close_date,
+                "fetched_at": now_ts,
+                "fetched_at_text": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
             save_yf_close_cache(cache)
+
             return close_value, close_date, "yfinance"
+
         except Exception as e:
             last_error = f"{yf_symbol}: {e}"
             continue
 
     if isinstance(cached, dict) and cached.get("close") is not None:
         return float(cached["close"]), cached.get("date", ""), "stale cache"
+
     return None, "", last_error or "no data"
-
-
-def normalize_symbol_quick(input_text: str):
-    s = str(input_text).strip().upper()
-    if not s:
-        return None
-    if "." in s:
-        return s
-    if s.isdigit():
-        if s.startswith(("3", "6", "8")):
-            return f"{s}.TWO"
-        return f"{s}.TW"
-    return s
-
-
-def normalize_symbols_from_text(text: str):
-    if not text:
-        return []
-    text = text.replace("，", ",")
-    items = []
-    for raw_line in text.splitlines():
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        items.extend([p.strip().upper() for p in raw_line.split(",") if p.strip()])
-
-    result, seen = [], set()
-    for item in items:
-        symbol = normalize_symbol_quick(item)
-        if symbol and symbol not in seen:
-            seen.add(symbol)
-            result.append(symbol)
-    return result
 
 
 # =============================================================================
@@ -305,18 +446,25 @@ def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
     name_to_symbol = {}
 
     if not os.path.exists(file_path):
-        return {"code_to_name": code_to_name, "code_to_symbol": code_to_symbol, "name_to_symbol": name_to_symbol}
+        return {
+            "code_to_name": code_to_name,
+            "code_to_symbol": code_to_symbol,
+            "name_to_symbol": name_to_symbol,
+        }
 
     with open(file_path, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip().replace("\ufeff", "").replace("\u3000", " ")
+
             if not line:
                 continue
+
             if "\t" in line:
                 parts = [p.strip() for p in line.split("\t") if p.strip()]
             else:
                 m = re.match(r"^([^\s]+)\s+(.+)$", line)
                 parts = [m.group(1).strip(), m.group(2).strip()] if m else []
+
             if len(parts) < 2:
                 continue
 
@@ -324,14 +472,20 @@ def load_stock_lookup_maps(file_path: str = STOCK_NAME_FILE) -> dict:
             stock_name = parts[1].strip()
             symbol = normalize_symbol_quick(raw_symbol)
             code = symbol_to_code(symbol)
+
             if not code or not stock_name:
                 continue
+
             code_to_name[code] = stock_name
             code_to_symbol[code] = symbol
             name_to_symbol[stock_name] = symbol
             name_to_symbol[stock_name.replace(" ", "")] = symbol
 
-    return {"code_to_name": code_to_name, "code_to_symbol": code_to_symbol, "name_to_symbol": name_to_symbol}
+    return {
+        "code_to_name": code_to_name,
+        "code_to_symbol": code_to_symbol,
+        "name_to_symbol": name_to_symbol,
+    }
 
 
 @st.cache_data(ttl=86400)
@@ -343,36 +497,44 @@ def get_stock_name(symbol: str) -> str:
 
 def resolve_stock_query(input_text: str):
     q_raw = str(input_text).strip()
+
     if not q_raw:
         return None, None, None
+
     lookup = load_stock_lookup_maps(STOCK_NAME_FILE)
     code_to_name = lookup.get("code_to_name", {})
     code_to_symbol = lookup.get("code_to_symbol", {})
     name_to_symbol = lookup.get("name_to_symbol", {})
 
     q_upper = q_raw.upper()
+
     if "." in q_upper:
         code = symbol_to_code(q_upper)
         return q_upper, code_to_name.get(code, code), "ticker"
+
     if q_upper.isdigit():
         symbol = code_to_symbol.get(q_upper) or normalize_symbol_quick(q_upper)
         return symbol, code_to_name.get(q_upper, q_upper), "code"
 
     symbol = name_to_symbol.get(q_raw) or name_to_symbol.get(q_raw.replace(" ", ""))
+
     if symbol:
         code = symbol_to_code(symbol)
         return symbol, code_to_name.get(code, q_raw), "name"
 
     compact = q_raw.replace(" ", "")
+
     for stock_name, candidate_symbol in name_to_symbol.items():
         if compact and compact in stock_name.replace(" ", ""):
             code = symbol_to_code(candidate_symbol)
             return candidate_symbol, code_to_name.get(code, stock_name), "name_partial"
 
     symbol = normalize_symbol_quick(q_raw)
+
     if symbol:
         code = symbol_to_code(symbol)
         return symbol, code_to_name.get(code, code), "fallback"
+
     return None, None, None
 
 
@@ -402,6 +564,7 @@ class FubonRealtimeManager:
     def login(self, fubon_id: str, fubon_password: str, cert_password: str, pfx_base64: str):
         if FubonSDK is None:
             raise RuntimeError("富邦 SDK 尚未安裝或載入失敗")
+
         try:
             if self.ws is not None:
                 self.ws.disconnect()
@@ -420,12 +583,15 @@ class FubonRealtimeManager:
             self.tick_status = {}
 
         pfx_base64 = str(pfx_base64).strip()
+
         if "," in pfx_base64 and "base64" in pfx_base64[:80].lower():
             pfx_base64 = pfx_base64.split(",", 1)[1].strip()
+
         try:
             cert_bytes = base64.b64decode(pfx_base64, validate=True)
         except Exception as e:
             raise RuntimeError(f"pfx_base64 不是有效的 Base64 憑證資料：{e}")
+
         if not cert_bytes:
             raise RuntimeError("pfx_base64 解碼後是空資料")
 
@@ -436,29 +602,41 @@ class FubonRealtimeManager:
 
         sdk = None
         ws = None
+
         try:
             sdk = FubonSDK()
-            login_result = sdk.login(fubon_id.strip().upper(), fubon_password, self.cert_path, cert_password)
+            login_result = sdk.login(
+                fubon_id.strip().upper(),
+                fubon_password,
+                self.cert_path,
+                cert_password,
+            )
+
             is_success = getattr(login_result, "is_success", None)
             message = getattr(login_result, "message", None)
+
             if is_success is False:
                 raise RuntimeError(f"富邦登入失敗：{message or login_result}")
+
             sdk.init_realtime()
             ws = sdk.marketdata.websocket_client.stock
             ws.on("message", self._on_message)
             ws.connect()
+
             with self.lock:
                 self.sdk = sdk
                 self.ws = ws
                 self.logged_in = True
                 self.connected = True
                 self.error = None
+
         except Exception as e:
             try:
                 if ws is not None:
                     ws.disconnect()
             except Exception:
                 pass
+
             with self.lock:
                 self.sdk = None
                 self.ws = None
@@ -469,6 +647,7 @@ class FubonRealtimeManager:
                 self.subscribed = set()
                 self.last_message_at = None
                 self.tick_status = {}
+
             raise
 
     def _parse_message(self, message):
@@ -477,8 +656,10 @@ class FubonRealtimeManager:
                 return json.loads(message)
             except Exception:
                 return {"raw_text": message}
+
         if isinstance(message, dict):
             return message
+
         return {"raw_unknown": str(message)}
 
     def _safe_float(self, value):
@@ -487,6 +668,7 @@ class FubonRealtimeManager:
                 return None
         except Exception:
             pass
+
         try:
             return float(str(value).strip().replace(",", ""))
         except Exception:
@@ -494,124 +676,173 @@ class FubonRealtimeManager:
 
     def _safe_int(self, value):
         val = self._safe_float(value)
+
         if val is None:
             return None
+
         return int(round(val))
 
     def _extract_symbol(self, msg):
         data = msg.get("data", {})
+
         if not isinstance(data, dict):
             data = {}
-        symbol = data.get("symbol") or msg.get("symbol") or data.get("stockNo") or msg.get("stockNo")
+
+        symbol = (
+            data.get("symbol")
+            or msg.get("symbol")
+            or data.get("stockNo")
+            or msg.get("stockNo")
+        )
+
         return symbol_to_code(symbol) if symbol else None
 
     def _extract_price(self, msg):
         data = msg.get("data", {})
+
         if not isinstance(data, dict):
             data = {}
+
         candidates = [
-            data.get("price"), data.get("tradePrice"), data.get("lastPrice"),
-            data.get("close"), data.get("closePrice"),
-            msg.get("price"), msg.get("tradePrice"), msg.get("lastPrice"),
-            msg.get("close"), msg.get("closePrice"),
+            data.get("price"),
+            data.get("tradePrice"),
+            data.get("lastPrice"),
+            data.get("close"),
+            data.get("closePrice"),
+            msg.get("price"),
+            msg.get("tradePrice"),
+            msg.get("lastPrice"),
+            msg.get("close"),
+            msg.get("closePrice"),
         ]
+
         for value in candidates:
             price = self._safe_float(value)
             if price is not None:
                 return price
+
         return None
 
     def _extract_cumulative_volume(self, msg):
-        """讀取富邦 trades 的累積成交量欄位。
-
-        目前畫面中「最新單筆」出現 14780、95466 等大數字，代表來源欄位其實是盤中累積成交量，
-        所以不能直接顯示；必須在 _on_message 內用差值換算單筆量。
-        """
+        """讀取富邦 trades 的累積成交量欄位。"""
         data = msg.get("data", {})
+
         if not isinstance(data, dict):
             data = {}
+
         candidates = [
-            data.get("volume"), data.get("tradeVolume"), data.get("totalVolume"), data.get("total_volume"),
-            data.get("accVolume"), data.get("accTradeVolume"), data.get("cumulativeVolume"),
-            msg.get("volume"), msg.get("tradeVolume"), msg.get("totalVolume"), msg.get("total_volume"),
-            msg.get("accVolume"), msg.get("accTradeVolume"), msg.get("cumulativeVolume"),
+            data.get("volume"),
+            data.get("tradeVolume"),
+            data.get("totalVolume"),
+            data.get("total_volume"),
+            data.get("accVolume"),
+            data.get("accTradeVolume"),
+            data.get("cumulativeVolume"),
+            msg.get("volume"),
+            msg.get("tradeVolume"),
+            msg.get("totalVolume"),
+            msg.get("total_volume"),
+            msg.get("accVolume"),
+            msg.get("accTradeVolume"),
+            msg.get("cumulativeVolume"),
         ]
+
         for value in candidates:
             volume = self._safe_int(value)
             if volume is not None:
                 return volume
+
         return None
 
     def _extract_tick_size(self, msg):
         """讀取富邦 trades 的單筆成交量欄位；size 才是單筆，volume 多半是盤中累積量。"""
         data = msg.get("data", {})
+
         if not isinstance(data, dict):
             data = {}
+
         candidates = [
-            data.get("size"), data.get("tradeSize"), data.get("trade_size"), data.get("quantity"), data.get("qty"),
-            msg.get("size"), msg.get("tradeSize"), msg.get("trade_size"), msg.get("quantity"), msg.get("qty"),
+            data.get("size"),
+            data.get("tradeSize"),
+            data.get("trade_size"),
+            data.get("quantity"),
+            data.get("qty"),
+            msg.get("size"),
+            msg.get("tradeSize"),
+            msg.get("trade_size"),
+            msg.get("quantity"),
+            msg.get("qty"),
         ]
+
         for value in candidates:
             size = self._safe_int(value)
             if size is not None:
                 return size
+
         return None
 
     def _extract_trade_type(self, msg, price=None):
         data = msg.get("data", {})
+
         if not isinstance(data, dict):
             data = {}
+
         candidates = [
-            data.get("tradeType"), data.get("tickType"), data.get("type"), data.get("side"), data.get("dealType"),
-            msg.get("tradeType"), msg.get("tickType"), msg.get("type"), msg.get("side"), msg.get("dealType"),
+            data.get("tradeType"),
+            data.get("tickType"),
+            data.get("type"),
+            data.get("side"),
+            data.get("dealType"),
+            msg.get("tradeType"),
+            msg.get("tickType"),
+            msg.get("type"),
+            msg.get("side"),
+            msg.get("dealType"),
         ]
-        raw_type = next((str(x).strip() for x in candidates if x is not None and str(x).strip()), "")
+
+        raw_type = next(
+            (str(x).strip() for x in candidates if x is not None and str(x).strip()),
+            "",
+        )
+
         raw_upper = raw_type.upper()
+
         if raw_upper in ["BUY", "B", "BID", "外盤", "外盤(買)", "買", "1"]:
             return "外盤(買)"
+
         if raw_upper in ["SELL", "S", "ASK", "內盤", "內盤(賣)", "賣", "2"]:
             return "內盤(賣)"
 
-        # 若未提供內外盤欄位，嘗試用成交價與買一/賣一判斷。
+        # 若未提供內外盤欄位，嘗試用成交價與買一 / 賣一判斷。
         if price is not None:
-            bid = self._safe_float(data.get("bid") or data.get("bidPrice") or data.get("bestBidPrice") or msg.get("bid") or msg.get("bidPrice"))
-            ask = self._safe_float(data.get("ask") or data.get("askPrice") or data.get("bestAskPrice") or msg.get("ask") or msg.get("askPrice"))
+            bid = self._safe_float(
+                data.get("bid")
+                or data.get("bidPrice")
+                or data.get("bestBidPrice")
+                or msg.get("bid")
+                or msg.get("bidPrice")
+            )
+
+            ask = self._safe_float(
+                data.get("ask")
+                or data.get("askPrice")
+                or data.get("bestAskPrice")
+                or msg.get("ask")
+                or msg.get("askPrice")
+            )
+
             if ask is not None and price >= ask:
                 return "外盤(買)"
+
             if bid is not None and price <= bid:
                 return "內盤(賣)"
+
         return "-"
-
-    def _format_large_order_text(self, large_order):
-        if not large_order:
-            return "監控中"
-        lo_time = large_order.get("time")
-        time_text = lo_time.strftime("%H:%M:%S") if hasattr(lo_time, "strftime") else "--:--:--"
-        price = large_order.get("price")
-        price_text = f"@{price:.2f}" if isinstance(price, (int, float)) else ""
-        volume = large_order.get("volume")
-        trade_type = large_order.get("type") or "-"
-        icon = "🚀" if trade_type == "外盤(買)" else "📉" if trade_type == "內盤(賣)" else "🔔"
-        return f"{icon} {time_text} {volume}張 {price_text} {trade_type}"
-
-
-    def _format_momentum_signal_text(self, signal):
-        """格式化「累積大單 + 秒級拉抬」訊號。"""
-        if not signal or not signal.get("active"):
-            return "監控中"
-        signal_time = signal.get("time")
-        time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
-        current_price = signal.get("current_price")
-        price_text = f"@{current_price:.2f}" if isinstance(current_price, (int, float)) else ""
-        return (
-            f"🔥 {time_text} {int(signal.get('window_sec', 0))}秒內 "
-            f"外盤大單累積{int(signal.get('cumulative_volume', 0))}張 "
-            f"拉抬+{float(signal.get('price_change_pct', 0)):.2f}% {price_text}"
-        )
 
     def _on_message(self, message):
         msg = self._parse_message(message)
         now = datetime.now(TW_TZ)
+
         symbol = self._extract_symbol(msg)
         price = self._extract_price(msg)
         direct_tick_size = self._extract_tick_size(msg)
@@ -620,9 +851,14 @@ class FubonRealtimeManager:
 
         with self.lock:
             self.last_message_at = now
+
             if not symbol:
                 return
-            self.messages[symbol] = {"time": now, "raw": msg}
+
+            self.messages[symbol] = {
+                "time": now,
+                "raw": msg,
+            }
 
             status = self.tick_status.get(symbol, {
                 "last_ws_price": None,
@@ -631,43 +867,37 @@ class FubonRealtimeManager:
                 "last_trade_type": "-",
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
-                "recent_tick_orders": [],
-                "price_history": [],
-                "latest_large_order": None,
-                "latest_momentum_signal": None,
+                "recent_ticks": [],
             })
 
             if price is not None:
                 status["last_ws_price"] = price
-                # 保存最近 5 分鐘價格軌跡，用來判斷「N 秒內瞬間拉抬 X%」。
-                price_history = status.get("price_history", [])
-                price_history.append({"time": now, "price": float(price)})
-                status["price_history"] = [
-                    p for p in price_history
-                    if hasattr(p.get("time"), "timestamp") and (now - p.get("time")).total_seconds() <= 300
-                ][-500:]
 
-            # ===== 重點修正：累積量轉單筆量 =====
-            # 富邦 trades 的 volume 常是「盤中累積成交量」。
-            # 第一筆收到時沒有前值可扣，因此不當作單筆大單；第二筆後用差值才是真正最新單筆。
+            # 最新單筆量：
+            # 1. 優先使用 size / tradeSize 等單筆欄位。
+            # 2. 若沒有 size，才用本次累積量 - 上次累積量換算。
             tick_volume = None
-            # 富邦 trades payload 若有 size，size 才是單筆成交量；volume 多半是盤中累積量。
-            # 例如 Debug：size=11、volume=230，應判斷 11 張，而不是把 230 當最新單筆。
+
             if direct_tick_size is not None:
                 tick_volume = int(direct_tick_size)
+
                 if cumulative_volume is not None:
                     status["last_cumulative_volume"] = int(cumulative_volume)
+
             elif cumulative_volume is not None:
                 prev_cum = status.get("last_cumulative_volume")
+
                 if prev_cum is not None:
                     diff = int(cumulative_volume) - int(prev_cum)
+
                     if diff > 0:
                         tick_volume = diff
                     elif diff == 0:
                         tick_volume = 0
                     else:
-                        # 可能跨日、重連或資料重置，先重設基準，不用負數。
+                        # 可能跨日、重連或資料重置，不使用負數。
                         tick_volume = None
+
                 status["last_cumulative_volume"] = int(cumulative_volume)
 
             if tick_volume is not None:
@@ -679,34 +909,42 @@ class FubonRealtimeManager:
             if tick_volume is not None and tick_volume > 0:
                 if trade_type == "外盤(買)":
                     status["total_buy_vol"] = int(status.get("total_buy_vol", 0) or 0) + tick_volume
+
                 elif trade_type == "內盤(賣)":
                     status["total_sell_vol"] = int(status.get("total_sell_vol", 0) or 0) + tick_volume
 
-                # 不在 WebSocket callback 內使用固定門檻過濾，避免 UI 調整大單張數後仍沿用舊門檻。
-                tick_order = {
+                tick = {
                     "time": now,
                     "price": status.get("last_ws_price"),
                     "volume": int(tick_volume),
                     "type": status.get("last_trade_type", "-"),
                 }
-                recent_orders = status.get("recent_tick_orders", [])
-                recent_orders.append(tick_order)
-                status["recent_tick_orders"] = recent_orders[-200:]
-                status["latest_large_order"] = tick_order
+
+                recent_ticks = status.get("recent_ticks", [])
+                recent_ticks.append(tick)
+                status["recent_ticks"] = recent_ticks[-200:]
 
             self.tick_status[symbol] = status
 
     def subscribe(self, symbol: str):
         if not self.ws:
             return
+
         code = symbol_to_code(symbol)
+
         if not code or code in self.subscribed:
             return
+
         try:
-            self.ws.subscribe({"channel": "trades", "symbol": code})
+            self.ws.subscribe({
+                "channel": "trades",
+                "symbol": code,
+            })
+
             with self.lock:
                 self.subscribed.add(code)
                 self.error = None
+
         except Exception as e:
             with self.lock:
                 self.error = f"{code} WebSocket 訂閱失敗：{e}"
@@ -717,169 +955,23 @@ class FubonRealtimeManager:
 
     def get_message(self, symbol: str):
         code = symbol_to_code(symbol)
+
         with self.lock:
             return copy.deepcopy(self.messages.get(code))
 
-    def get_order_status(self, symbol: str, large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD):
+    def get_tick_status(self, symbol: str):
         code = symbol_to_code(symbol)
-        try:
-            threshold = max(1, int(large_order_threshold))
-        except Exception:
-            threshold = DEFAULT_LARGE_ORDER_THRESHOLD
+
         with self.lock:
-            status = copy.deepcopy(self.tick_status.get(code, {
+            return copy.deepcopy(self.tick_status.get(code, {
                 "last_ws_price": None,
                 "last_cumulative_volume": None,
                 "real_tick_volume": None,
                 "last_trade_type": "-",
                 "total_buy_vol": 0,
                 "total_sell_vol": 0,
-                "recent_tick_orders": [],
-                "price_history": [],
-                "latest_large_order": None,
-                "latest_momentum_signal": None,
+                "recent_ticks": [],
             }))
-
-        latest_large_order = None
-        for order in reversed(status.get("recent_tick_orders", [])):
-            if int(order.get("volume") or 0) >= threshold:
-                latest_large_order = order
-                break
-
-        status["latest_large_order"] = latest_large_order
-        if latest_large_order:
-            status["large_order_text"] = self._format_large_order_text(latest_large_order)
-        else:
-            status["large_order_text"] = "監控中"
-        return status
-
-
-    def get_recent_large_orders(self, symbol: str, large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD, limit: int = 50):
-        """回傳最近符合目前大單門檻的所有成交，不只回傳最後一筆。"""
-        code = symbol_to_code(symbol)
-        try:
-            threshold = max(1, int(large_order_threshold))
-        except Exception:
-            threshold = DEFAULT_LARGE_ORDER_THRESHOLD
-        try:
-            limit = max(1, int(limit))
-        except Exception:
-            limit = 50
-        with self.lock:
-            status = copy.deepcopy(self.tick_status.get(code, {"recent_tick_orders": [], "price_history": []}))
-        orders = []
-        for order in status.get("recent_tick_orders", []):
-            try:
-                volume = int(order.get("volume") or 0)
-            except Exception:
-                volume = 0
-            if volume >= threshold:
-                orders.append(order)
-        orders.sort(key=lambda x: x.get("time") or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
-        return orders[:limit]
-
-    def get_momentum_signal(
-        self,
-        symbol: str,
-        large_order_threshold: int = DEFAULT_LARGE_ORDER_THRESHOLD,
-        cumulative_threshold: int = DEFAULT_MOMENTUM_CUMULATIVE_THRESHOLD,
-        window_sec: int = DEFAULT_MOMENTUM_WINDOW_SEC,
-        price_pct_threshold: float = DEFAULT_MOMENTUM_PRICE_PCT,
-    ):
-        """判斷「連續外盤大單 + N 秒內價格拉抬」訊號。
-
-        邏輯：
-        1. 最近 window_sec 秒內，只計算「外盤(買)」且單筆 >= large_order_threshold 的成交。
-        2. 這些大單累積張數 >= cumulative_threshold。
-        3. 目前價格相對 window_sec 秒內最早價格，漲幅 >= price_pct_threshold。
-        """
-        code = symbol_to_code(symbol)
-        try:
-            single_threshold = max(1, int(large_order_threshold))
-        except Exception:
-            single_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
-        try:
-            cumulative_threshold = max(1, int(cumulative_threshold))
-        except Exception:
-            cumulative_threshold = DEFAULT_MOMENTUM_CUMULATIVE_THRESHOLD
-        try:
-            window_sec = max(1, int(window_sec))
-        except Exception:
-            window_sec = DEFAULT_MOMENTUM_WINDOW_SEC
-        try:
-            price_pct_threshold = max(0.0, float(price_pct_threshold))
-        except Exception:
-            price_pct_threshold = DEFAULT_MOMENTUM_PRICE_PCT
-
-        now = datetime.now(TW_TZ)
-        with self.lock:
-            status = copy.deepcopy(self.tick_status.get(code, {
-                "last_ws_price": None,
-                "recent_tick_orders": [],
-                "price_history": [],
-                "latest_momentum_signal": None,
-            }))
-
-        current_price = status.get("last_ws_price")
-        recent_orders = []
-        for order in status.get("recent_tick_orders", []):
-            order_time = order.get("time")
-            if not hasattr(order_time, "timestamp"):
-                continue
-            age_sec = (now - order_time).total_seconds()
-            try:
-                volume = int(order.get("volume") or 0)
-            except Exception:
-                volume = 0
-            if (
-                0 <= age_sec <= window_sec
-                and order.get("type") == "外盤(買)"
-                and volume >= single_threshold
-            ):
-                recent_orders.append(order)
-
-        cumulative_volume = sum(int(o.get("volume") or 0) for o in recent_orders)
-
-        price_points = []
-        for point in status.get("price_history", []):
-            point_time = point.get("time")
-            point_price = self._safe_float(point.get("price"))
-            if not hasattr(point_time, "timestamp") or point_price is None or point_price <= 0:
-                continue
-            age_sec = (now - point_time).total_seconds()
-            if 0 <= age_sec <= window_sec:
-                price_points.append(point)
-        price_points.sort(key=lambda x: x.get("time"))
-
-        start_price = self._safe_float(price_points[0].get("price")) if price_points else None
-        price_change_pct = None
-        if current_price is not None and start_price is not None and start_price > 0:
-            price_change_pct = (float(current_price) / float(start_price) - 1) * 100
-
-        active = (
-            cumulative_volume >= cumulative_threshold
-            and price_change_pct is not None
-            and price_change_pct >= price_pct_threshold
-        )
-        signal = {
-            "active": bool(active),
-            "time": now,
-            "window_sec": window_sec,
-            "single_threshold": single_threshold,
-            "cumulative_threshold": cumulative_threshold,
-            "cumulative_volume": int(cumulative_volume),
-            "large_order_count": len(recent_orders),
-            "price_pct_threshold": float(price_pct_threshold),
-            "price_change_pct": price_change_pct,
-            "start_price": start_price,
-            "current_price": current_price,
-            "orders": recent_orders,
-        }
-        signal["text"] = self._format_momentum_signal_text(signal)
-        if active:
-            with self.lock:
-                self.tick_status.setdefault(code, {})["latest_momentum_signal"] = signal
-        return signal
 
     def get_status(self):
         with self.lock:
@@ -900,10 +992,13 @@ def load_stock_groups():
         try:
             with open(GROUPS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+
             if isinstance(data, dict) and data:
                 return data
+
         except Exception:
             pass
+
     return copy.deepcopy(DEFAULT_STOCK_GROUPS)
 
 
@@ -914,32 +1009,16 @@ def save_stock_groups(groups):
 
 def save_backup_snapshot(groups):
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    file_path = os.path.join(BACKUP_DIR, f"stock_groups_backup_{datetime.now(TW_TZ).strftime('%Y%m%d_%H%M%S')}.json")
+
+    file_path = os.path.join(
+        BACKUP_DIR,
+        f"stock_groups_backup_{datetime.now(TW_TZ).strftime('%Y%m%d_%H%M%S')}.json",
+    )
+
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(groups, f, ensure_ascii=False, indent=2)
+
     return file_path
-
-
-# =============================================================================
-# Telegram
-# =============================================================================
-def send_telegram_message(text: str):
-    """送出 Telegram 訊息；需要在 Streamlit secrets 設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        res = requests.post(url, json=payload, timeout=5)
-        if res.status_code != 200:
-            st.error(f"Telegram 傳送失敗，API 回傳：{res.text}")
-    except Exception as e:
-        st.error(f"Telegram 連線失敗: {e}")
 
 
 # =============================================================================
@@ -947,194 +1026,48 @@ def send_telegram_message(text: str):
 # =============================================================================
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = True
+
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
-if "large_order_threshold" not in st.session_state:
-    st.session_state.large_order_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
-if "momentum_cumulative_threshold" not in st.session_state:
-    st.session_state.momentum_cumulative_threshold = DEFAULT_MOMENTUM_CUMULATIVE_THRESHOLD
-if "momentum_window_sec" not in st.session_state:
-    st.session_state.momentum_window_sec = DEFAULT_MOMENTUM_WINDOW_SEC
-if "momentum_price_pct" not in st.session_state:
-    st.session_state.momentum_price_pct = DEFAULT_MOMENTUM_PRICE_PCT
-if "telegram_pct_threshold" not in st.session_state:
-    st.session_state.telegram_pct_threshold = 3.0
+
 if "stock_groups" not in st.session_state:
     st.session_state.stock_groups = load_stock_groups()
+
 if "group_editor_unlocked" not in st.session_state:
     st.session_state.group_editor_unlocked = False
+
 if "editing_mode" not in st.session_state:
     st.session_state.editing_mode = False
+
 if "selected_group_editor" not in st.session_state:
     group_names_init = list(st.session_state.stock_groups.keys())
     st.session_state.selected_group_editor = group_names_init[0] if group_names_init else ""
+
 if "rename_group_input" not in st.session_state:
     st.session_state.rename_group_input = st.session_state.selected_group_editor
+
 if "symbols_text_area" not in st.session_state:
     selected = st.session_state.selected_group_editor
     st.session_state.symbols_text_area = "\n".join(st.session_state.stock_groups.get(selected, []))
+
 if "quick_add_symbol_input" not in st.session_state:
     st.session_state.quick_add_symbol_input = ""
+
 if "fubon_manager" not in st.session_state:
     st.session_state.fubon_manager = FubonRealtimeManager()
+
 if "fubon_logged_in" not in st.session_state:
     st.session_state.fubon_logged_in = False
-if "tg_push_enabled" not in st.session_state:
-    st.session_state.tg_push_enabled = False
-if "large_order_toast_keys" not in st.session_state:
-    # 用來避免同一筆大單在自動刷新時重複跳出 toast / Telegram
-    st.session_state.large_order_toast_keys = set()
-if "_large_order_toast_messages" not in st.session_state:
-    # 大單買入 toast 佇列；資料掃描階段加入，畫面輸出前統一顯示
-    st.session_state._large_order_toast_messages = []
 
 
 def show_pending_toasts():
-    """顯示右上角 toast。duration='long' 約為 10 秒。"""
-    if "_threshold_changed_message" in st.session_state:
-        st.toast(st.session_state._threshold_changed_message, icon="✅", duration="long")
-        del st.session_state._threshold_changed_message
     if "_quick_add_success_message" in st.session_state:
         st.toast(st.session_state._quick_add_success_message, duration="long")
         del st.session_state._quick_add_success_message
 
-    messages = st.session_state.get("_large_order_toast_messages", [])
-    if messages:
-        # 避免同一輪太多 toast 佔滿畫面，最多顯示最新 3 則
-        for msg in messages[-3:]:
-            st.toast(msg, icon="🚀", duration="long")
-        st.session_state._large_order_toast_messages = []
 
-
-def queue_large_buy_toast(group_name, code, stock_name, latest, change_pct):
-    """偵測到外盤買入大單時，加入 toast 佇列；若 Telegram 開啟則同步推送。"""
-    if not latest or latest.get("type") != "外盤(買)":
-        return
-
-    order_time = latest.get("time")
-    time_key = order_time.strftime("%Y%m%d%H%M%S") if hasattr(order_time, "strftime") else str(order_time)
-    volume = int(latest.get("volume") or 0)
-    price = latest.get("price")
-    toast_key = f"{code}_{time_key}_{volume}_{latest.get('type', '-')}_{price}_th{st.session_state.get('large_order_threshold', DEFAULT_LARGE_ORDER_THRESHOLD)}"
-
-    # 同一筆大單只通知一次，避免自動刷新時重複跳出 toast / Telegram
-    if toast_key in st.session_state.large_order_toast_keys:
-        return
-
-    time_text = order_time.strftime("%H:%M:%S") if hasattr(order_time, "strftime") else "--:--:--"
-    price_text = f"{float(price):.2f}" if isinstance(price, (int, float)) else "-"
-    pct_text = format_pct_value(change_pct)
-
-    toast_msg = (
-        f"🚀 大單買入偵測\n"
-        f"{group_name}｜{code} {stock_name}\n"
-        f"單筆：{volume} 張｜價格：{price_text}\n"
-        f"時間：{time_text}｜漲幅：{pct_text}"
-    )
-    st.session_state._large_order_toast_messages.append(toast_msg)
-
-    should_send_telegram = False
-    try:
-        if change_pct is not None:
-            pct_threshold = abs(float(st.session_state.get("telegram_pct_threshold", 3.0) or 3.0))
-            should_send_telegram = abs(float(change_pct)) >= pct_threshold
-    except Exception:
-        should_send_telegram = False
-
-    if st.session_state.get("tg_push_enabled", False) and should_send_telegram:
-        yahoo_url = yahoo_quote_url(code)
-        telegram_msg = (
-            f"🚀 <b>大單買入偵測</b>\n"
-            f"分類：{group_name}\n"
-            f"股票：<a href='{yahoo_url}'>{code} {stock_name}</a>\n"
-            f"單筆：<b>{volume}</b> 張\n"
-            f"價格：<b>{price_text}</b>\n"
-            f"時間：{time_text}\n"
-            f"漲幅：{pct_text}\n"
-            f"推送門檻：±{pct_threshold:.1f}%"
-        )
-        send_telegram_message(telegram_msg)
-
-    st.session_state.large_order_toast_keys.add(toast_key)
-
-    # 控制記憶體，保留最近約 500 筆去重紀錄
-    if len(st.session_state.large_order_toast_keys) > 500:
-        st.session_state.large_order_toast_keys = set(list(st.session_state.large_order_toast_keys)[-300:])
-
-
-# 顯示上一輪 rerun 留下的提示，例如快速新增股票成功
 show_pending_toasts()
 
-
-def queue_momentum_toast(group_name, code, stock_name, signal, change_pct):
-    """偵測到「累積外盤大單 + 秒級拉抬」時，加入 toast 佇列；若 Telegram 開啟則同步推送。"""
-    if not signal or not signal.get("active"):
-        return
-    signal_time = signal.get("time")
-    time_key = signal_time.strftime("%Y%m%d%H%M%S") if hasattr(signal_time, "strftime") else str(signal_time)
-    cumulative_volume = int(signal.get("cumulative_volume") or 0)
-    price_change_pct = float(signal.get("price_change_pct") or 0)
-    current_price = signal.get("current_price")
-    toast_key = (
-        f"MOM_{code}_{time_key}_{cumulative_volume}_"
-        f"{price_change_pct:.2f}_{current_price}_"
-        f"w{signal.get('window_sec')}_cum{signal.get('cumulative_threshold')}_pct{signal.get('price_pct_threshold')}"
-    )
-    if toast_key in st.session_state.large_order_toast_keys:
-        return
-
-    time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
-    price_text = f"{float(current_price):.2f}" if isinstance(current_price, (int, float)) else "-"
-    toast_msg = (
-        f"🔥 秒級拉抬訊號\n"
-        f"{group_name}｜{code} {stock_name}\n"
-        f"{int(signal.get('window_sec', 0))}秒內外盤大單累積：{cumulative_volume} 張\n"
-        f"價格拉抬：+{price_change_pct:.2f}%｜現價：{price_text}\n"
-        f"時間：{time_text}｜大單筆數：{int(signal.get('large_order_count', 0))}"
-    )
-    st.session_state._large_order_toast_messages.append(toast_msg)
-
-    if st.session_state.get("tg_push_enabled", False):
-        yahoo_url = yahoo_quote_url(code)
-        telegram_msg = (
-            f"🔥 <b>秒級拉抬訊號</b>\n"
-            f"分類：{group_name}\n"
-            f"股票：<a href=\"{yahoo_url}\">{code} {stock_name}</a>\n"
-            f"{int(signal.get('window_sec', 0))}秒內外盤大單累積：<b>{cumulative_volume}</b> 張\n"
-            f"價格拉抬：<b>+{price_change_pct:.2f}%</b>\n"
-            f"現價：<b>{price_text}</b>\n"
-            f"時間：{time_text}\n"
-            f"條件：單筆 ≥ {int(signal.get('single_threshold', 0))} 張；"
-            f"累積 ≥ {int(signal.get('cumulative_threshold', 0))} 張；"
-            f"拉抬 ≥ {float(signal.get('price_pct_threshold', 0)):.1f}%"
-        )
-        send_telegram_message(telegram_msg)
-
-    st.session_state.large_order_toast_keys.add(toast_key)
-    if len(st.session_state.large_order_toast_keys) > 500:
-        st.session_state.large_order_toast_keys = set(list(st.session_state.large_order_toast_keys)[-300:])
-
-
-def on_large_order_threshold_change():
-    """大單門檻變更時立即同步，並清掉通知去重快取。"""
-    try:
-        new_threshold = max(1, int(st.session_state.get("large_order_threshold", DEFAULT_LARGE_ORDER_THRESHOLD)))
-    except Exception:
-        new_threshold = DEFAULT_LARGE_ORDER_THRESHOLD
-    st.session_state.large_order_threshold = new_threshold
-    st.session_state.large_order_toast_keys = set()
-    st.session_state._threshold_changed_message = f"大單門檻已即時更新為 {new_threshold} 張，並重新掃描最近成交。"
-
-
-
-def on_momentum_params_change():
-    """拉抬訊號參數變更時清掉通知去重快取。"""
-    st.session_state.large_order_toast_keys = set()
-    st.session_state._threshold_changed_message = (
-        f"拉抬訊號條件已更新：{int(st.session_state.momentum_window_sec)}秒內，"
-        f"外盤大單累積 ≥ {int(st.session_state.momentum_cumulative_threshold)} 張，"
-        f"價格拉抬 ≥ {float(st.session_state.momentum_price_pct):.1f}%"
-    )
 
 def enter_edit_mode():
     st.session_state.editing_mode = True
@@ -1151,10 +1084,13 @@ def set_next_selected_group(group_name: str):
 if "_next_selected_group" in st.session_state:
     pending_group = st.session_state._next_selected_group
     del st.session_state._next_selected_group
+
     if pending_group in st.session_state.stock_groups:
         st.session_state.selected_group_editor = pending_group
         st.session_state.rename_group_input = pending_group
-        st.session_state.symbols_text_area = "\n".join(st.session_state.stock_groups.get(pending_group, []))
+        st.session_state.symbols_text_area = "\n".join(
+            st.session_state.stock_groups.get(pending_group, [])
+        )
 
 
 # =============================================================================
@@ -1173,7 +1109,7 @@ def render_fubon_login():
     status = manager.get_status()
 
     if FubonSDK is None:
-        st.sidebar.error("富邦 SDK 未載入，無法監控盤中大單。")
+        st.sidebar.error("富邦 SDK 未載入，無法監控盤中成交。")
         return
 
     if st.sidebar.button("清除 / 重建富邦連線狀態", width="stretch"):
@@ -1185,24 +1121,31 @@ def render_fubon_login():
     if st.session_state.fubon_logged_in:
         st.sidebar.success("✅ 富邦 WebSocket 已連線")
         st.sidebar.caption(f"已訂閱：{status['subscribed_count']} 檔")
+
         if status["last_message_at"]:
             st.sidebar.caption(f"最後資料：{status['last_message_at'].strftime('%H:%M:%S')}")
+
         if status["error"]:
             st.sidebar.warning(status["error"])
+
         c1, c2 = st.sidebar.columns(2)
+
         with c1:
             if st.button("盤中累積歸零", width="stretch"):
                 manager.reset_runtime_data()
                 st.rerun()
+
         with c2:
             if st.button("登出", width="stretch"):
                 st.session_state.fubon_manager = FubonRealtimeManager()
                 st.session_state.fubon_logged_in = False
                 st.session_state.pop("fubon_login_time", None)
                 st.rerun()
+
         return
 
     pfx_base64 = get_fubon_pfx_base64()
+
     if not pfx_base64:
         st.sidebar.warning("未設定 st.secrets['fubon']['pfx_base64']，無法登入富邦 WebSocket。")
         return
@@ -1211,19 +1154,23 @@ def render_fubon_login():
         f_id = st.text_input("身分證字號", key="fubon_id_input")
         f_pw = st.text_input("富邦登入密碼", key="fubon_pw_input", type="password")
         f_cert_pw = st.text_input("憑證密碼", key="fubon_cert_pw_input", type="password")
+
         if st.button("連線富邦 WebSocket", width="stretch"):
             if not f_id or not f_pw or not f_cert_pw:
                 st.warning("請填寫完整登入資訊")
             else:
                 try:
                     new_manager = FubonRealtimeManager()
+
                     with st.spinner("連線富邦 WebSocket 中..."):
                         new_manager.login(f_id, f_pw, f_cert_pw, pfx_base64)
+
                     st.session_state.fubon_manager = new_manager
                     st.session_state.fubon_logged_in = True
                     st.session_state.fubon_login_time = datetime.now(TW_TZ)
                     st.success("富邦 WebSocket 連線成功")
                     st.rerun()
+
                 except Exception as e:
                     st.session_state.fubon_manager = FubonRealtimeManager()
                     st.session_state.fubon_logged_in = False
@@ -1237,10 +1184,12 @@ def render_fubon_login():
 def sync_editor_fields_from_selected_group():
     groups = st.session_state.stock_groups
     selected_group = st.session_state.selected_group_editor
+
     if selected_group not in groups:
         group_names = list(groups.keys())
         selected_group = group_names[0] if group_names else ""
         st.session_state.selected_group_editor = selected_group
+
     st.session_state.rename_group_input = selected_group
     st.session_state.symbols_text_area = "\n".join(groups.get(selected_group, []))
     st.session_state.editing_mode = False
@@ -1248,15 +1197,23 @@ def sync_editor_fields_from_selected_group():
 
 def render_group_editor_lock():
     st.sidebar.markdown("## 🔐 分組編輯鎖")
+
     if st.session_state.group_editor_unlocked:
         st.sidebar.success("已解鎖，可編輯股票分組")
+
         if st.sidebar.button("鎖定編輯", key="lock_group_editor_btn", width="stretch"):
             st.session_state.group_editor_unlocked = False
             leave_edit_mode()
             st.rerun()
+
         return
 
-    pin_input = st.sidebar.text_input("請輸入 PIN 碼以編輯分組", type="password", key="group_edit_pin_input")
+    pin_input = st.sidebar.text_input(
+        "請輸入 PIN 碼以編輯分組",
+        type="password",
+        key="group_edit_pin_input",
+    )
+
     if st.sidebar.button("解鎖編輯", key="unlock_group_editor_btn", width="stretch"):
         if pin_input == GROUP_EDIT_PIN:
             st.session_state.group_editor_unlocked = True
@@ -1269,11 +1226,13 @@ def render_group_editor_lock():
 def render_stock_group_editor():
     st.sidebar.markdown("## 🛠️ 股票分組編輯")
     groups = st.session_state.stock_groups
+
     if not groups:
         groups = copy.deepcopy(DEFAULT_STOCK_GROUPS)
         st.session_state.stock_groups = groups
 
     group_names = list(groups.keys())
+
     if st.session_state.selected_group_editor not in group_names:
         st.session_state.selected_group_editor = group_names[0]
         st.session_state.rename_group_input = group_names[0]
@@ -1281,8 +1240,10 @@ def render_stock_group_editor():
 
     with st.sidebar.expander("➕ 新增分類", expanded=False):
         new_group_name = st.text_input("分類名稱", key="new_group_name_input")
+
         if st.button("新增分類", key="add_group_btn", width="stretch"):
             name = new_group_name.strip()
+
             if not name:
                 st.warning("請輸入分類名稱")
             elif name in groups:
@@ -1295,15 +1256,39 @@ def render_stock_group_editor():
                 st.rerun()
 
     with st.sidebar.expander("📝 編輯分類", expanded=True):
-        st.selectbox("選擇分類", options=group_names, key="selected_group_editor", on_change=sync_editor_fields_from_selected_group)
+        st.selectbox(
+            "選擇分類",
+            options=group_names,
+            key="selected_group_editor",
+            on_change=sync_editor_fields_from_selected_group,
+        )
+
         selected_group = st.session_state.selected_group_editor
-        new_group_name = st.text_input("分類名稱（可修改）", key="rename_group_input", on_change=enter_edit_mode)
-        symbols_text = st.text_area("股票清單（每行一檔，或逗號分隔）", height=180, key="symbols_text_area", on_change=enter_edit_mode)
+
+        new_group_name = st.text_input(
+            "分類名稱（可修改）",
+            key="rename_group_input",
+            on_change=enter_edit_mode,
+        )
+
+        symbols_text = st.text_area(
+            "股票清單（每行一檔，或逗號分隔）",
+            height=180,
+            key="symbols_text_area",
+            on_change=enter_edit_mode,
+        )
 
         st.markdown("### ⚡ 快速新增股票")
-        quick_input = st.text_input("輸入股票代碼或名稱", key="quick_add_symbol_input", on_change=enter_edit_mode)
+
+        quick_input = st.text_input(
+            "輸入股票代碼或名稱",
+            key="quick_add_symbol_input",
+            on_change=enter_edit_mode,
+        )
+
         if quick_input.strip():
             symbol, stock_name, _ = resolve_stock_query(quick_input)
+
             if symbol:
                 st.caption(f"查詢結果：{stock_name} / 將加入：{symbol}")
             else:
@@ -1311,10 +1296,12 @@ def render_stock_group_editor():
 
         if st.button("加入目前分類", key="quick_add_btn", width="stretch"):
             symbol, stock_name, _ = resolve_stock_query(quick_input)
+
             if not symbol:
                 st.warning("請輸入股票代碼或股票名稱")
             else:
                 current = groups.get(selected_group, [])
+
                 if symbol in current:
                     st.warning("此股票已存在於目前分類")
                 else:
@@ -1323,29 +1310,39 @@ def render_stock_group_editor():
                     st.session_state.stock_groups = groups
                     save_stock_groups(groups)
                     set_next_selected_group(selected_group)
+
                     if stock_name:
                         st.session_state._quick_add_success_message = f"已加入 {symbol}（{stock_name}）"
                     else:
                         st.session_state._quick_add_success_message = f"已加入 {symbol}"
+
                     st.rerun()
 
         c1, c2 = st.columns(2)
+
         with c1:
             if st.button("💾 儲存分類", key="save_group_btn", width="stretch"):
                 new_name = new_group_name.strip()
+
                 if not new_name:
                     st.warning("分類名稱不可為空")
                 elif new_name != selected_group and new_name in groups:
                     st.warning("分類名稱已存在")
                 else:
                     updated = {}
+
                     for k, v in groups.items():
-                        updated[new_name if k == selected_group else k] = normalize_symbols_from_text(symbols_text) if k == selected_group else v
+                        if k == selected_group:
+                            updated[new_name] = normalize_symbols_from_text(symbols_text)
+                        else:
+                            updated[k] = v
+
                     st.session_state.stock_groups = updated
                     save_stock_groups(updated)
                     leave_edit_mode()
                     set_next_selected_group(new_name)
                     st.rerun()
+
         with c2:
             if st.button("🗑️ 刪除分類", key="delete_group_btn", width="stretch"):
                 if len(groups) <= 1:
@@ -1359,20 +1356,43 @@ def render_stock_group_editor():
                     st.rerun()
 
     with st.sidebar.expander("📦 匯出 / 匯入 / 重設", expanded=False):
-        export_json = json.dumps(st.session_state.stock_groups, ensure_ascii=False, indent=2)
-        st.download_button("⬇️ 匯出目前分組 JSON", data=export_json, file_name="stock_groups.json", mime="application/json", width="stretch")
+        export_json = json.dumps(
+            st.session_state.stock_groups,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        st.download_button(
+            "⬇️ 匯出目前分組 JSON",
+            data=export_json,
+            file_name="stock_groups.json",
+            mime="application/json",
+            width="stretch",
+        )
+
         uploaded_file = st.file_uploader("上傳股票分組 JSON", type=["json"])
+
         if uploaded_file is not None and st.button("📥 匯入並覆蓋目前分組", width="stretch"):
             try:
                 data = json.loads(uploaded_file.read().decode("utf-8"))
+
                 if not isinstance(data, dict) or not data:
                     raise ValueError("JSON 最外層必須是非空物件")
+
                 save_backup_snapshot(st.session_state.stock_groups)
-                validated = {str(k).strip(): normalize_symbols_from_text("\n".join(v) if isinstance(v, list) else str(v)) for k, v in data.items()}
+
+                validated = {
+                    str(k).strip(): normalize_symbols_from_text(
+                        "\n".join(v) if isinstance(v, list) else str(v)
+                    )
+                    for k, v in data.items()
+                }
+
                 st.session_state.stock_groups = validated
                 save_stock_groups(validated)
                 set_next_selected_group(list(validated.keys())[0])
                 st.rerun()
+
             except Exception as e:
                 st.error(f"JSON 匯入失敗：{e}")
 
@@ -1381,6 +1401,7 @@ def render_stock_group_editor():
                 save_backup_snapshot(st.session_state.stock_groups)
             except Exception:
                 pass
+
             st.session_state.stock_groups = copy.deepcopy(DEFAULT_STOCK_GROUPS)
             save_stock_groups(st.session_state.stock_groups)
             set_next_selected_group(list(st.session_state.stock_groups.keys())[0])
@@ -1392,239 +1413,244 @@ def render_stock_group_editor():
 # =============================================================================
 if os.path.exists(APP_LOGO):
     title_icon_col, title_text_col = st.columns([0.45, 8])
+
     with title_icon_col:
         st.image(APP_LOGO, width=58)
-    with title_text_col:
-        st.markdown("## ⚡ 盤中大單進出監控")
-else:
-    st.markdown("## ⚡ 盤中大單進出監控")
 
-control_col1, control_col2, control_col3, control_col4, control_col5, control_col6, control_col7, control_col8, control_col9, control_col10 = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+    with title_text_col:
+        st.markdown("## ⚡ 盤中即時成交監控")
+else:
+    st.markdown("## ⚡ 盤中即時成交監控")
+
+
+control_col1, control_col2, control_col3, control_col4 = st.columns([1, 1, 1, 1])
+
 with control_col1:
     if st.button("🔄 手動刷新畫面", width="stretch"):
         st.rerun()
+
 with control_col2:
     st.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
+
 with control_col3:
-    tg_push = st.toggle(
-        "📲 Telegram 推送開關",
-        value=st.session_state.tg_push_enabled,
-        help="必須開啟此選項，機器人才會依推送漲跌幅門檻發送大單買入推播",
-    )
-    if tg_push != st.session_state.tg_push_enabled:
-        st.session_state.tg_push_enabled = tg_push
-        st.rerun()
-with control_col4:
-    st.number_input("刷新秒數", min_value=1, max_value=60, step=1, key="refresh_sec")
-with control_col5:
-    st.number_input("大單門檻（張）", min_value=1, step=1, key="large_order_threshold", on_change=on_large_order_threshold_change, help="調整後會立即用新門檻重新掃描最近 200 筆單筆成交。")
-with control_col6:
     st.number_input(
-        "推送漲跌幅門檻 (%)",
+        "刷新秒數",
+        min_value=1,
+        max_value=60,
+        step=1,
+        key="refresh_sec",
+    )
+
+with control_col4:
+    pct_threshold = st.number_input(
+        "漲幅門檻 (%)",
         min_value=0.0,
         max_value=10.0,
+        value=5.0,
         step=0.5,
-        key="telegram_pct_threshold",
-        help="Telegram 推送條件：漲跌幅絕對值 >= 此數字，且同時有大單買入。預設 3%。",
     )
-with control_col7:
-    pct_threshold = st.number_input("漲幅門檻 (%)", min_value=0.0, max_value=10.0, value=5.0, step=0.5)
-with control_col8:
-    st.number_input("累積大單門檻（張）", min_value=1, step=1, key="momentum_cumulative_threshold", on_change=on_momentum_params_change, help="秒級拉抬訊號：觀察秒數內，外盤買進且單筆達大單門檻的成交累積需超過/達到此張數。")
-with control_col9:
-    st.number_input("拉抬秒數", min_value=1, max_value=60, step=1, key="momentum_window_sec", on_change=on_momentum_params_change, help="秒級拉抬訊號的觀察視窗，預設 10 秒。")
-with control_col10:
-    st.number_input("拉抬門檻 (%)", min_value=0.0, max_value=10.0, step=0.5, key="momentum_price_pct", on_change=on_momentum_params_change, help="秒級拉抬訊號：觀察秒數內價格需上漲達此百分比，預設 2%。")
+
 
 render_fubon_login()
 render_group_editor_lock()
+
 if st.session_state.group_editor_unlocked:
     render_stock_group_editor()
 else:
     st.sidebar.info("目前為唯讀模式：輸入 PIN 後才能修改股票分組")
+
 
 manager = st.session_state.fubon_manager
 
 if st.session_state.fubon_logged_in:
     login_time = st.session_state.get("fubon_login_time")
     can_subscribe = True
+
     if login_time:
         can_subscribe = (datetime.now(TW_TZ) - login_time).total_seconds() >= 1
+
     if can_subscribe:
         all_symbols = []
+
         for stocks in st.session_state.stock_groups.values():
             all_symbols.extend(stocks)
+
         manager.subscribe_many(all_symbols)
     else:
         st.sidebar.info("等待富邦 WebSocket 連線穩定後訂閱股票...")
 
+
 status = manager.get_status()
+
 st.caption(f"更新時間：{datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+
 if status["connected"]:
     st.success(f"富邦 WebSocket 已連線｜已訂閱 {status['subscribed_count']} 檔")
 else:
     st.warning("富邦 WebSocket 尚未連線。請先在左側登入富邦，否則表格只會顯示監控中。")
+
 if status["last_message_at"]:
     st.caption(f"最後收到資料：{status['last_message_at'].strftime('%H:%M:%S')}")
+
 if status["error"]:
     st.error(status["error"])
 
-st.info("即時價由富邦 WebSocket trades 抓取；最新單筆優先使用富邦 trades 的 size 單筆成交量；若無 size 才用累積量差值；漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。")
-st.caption(
-    f"✅ 目前實際掃描條件：單筆大單 ≥ {int(st.session_state.large_order_threshold)} 張｜"
-    f"秒級拉抬：{int(st.session_state.momentum_window_sec)}秒內外盤大單累積 ≥ {int(st.session_state.momentum_cumulative_threshold)} 張，"
-    f"且價格拉抬 ≥ {float(st.session_state.momentum_price_pct):.1f}%"
+st.info(
+    "即時價由富邦 WebSocket trades 抓取；"
+    "最新單筆優先使用富邦 trades 的 size 單筆成交量；若無 size 才用累積量差值；"
+    "漲幅% = 富邦即時價 ÷ yfinance 昨日收盤價 - 1。"
+    "yfinance 昨收每小時更新一次並存入 yf_yesterday_close_cache.json。"
 )
 
-# ===== 先整理資料：同一份資料同時產生儀表板與表格 =====
+st.caption(
+    "✅ 目前版本已移除所有大單判定、大單提醒、秒級拉抬與 Telegram 推送邏輯。"
+)
+
+
+# =============================================================================
+# 整理資料：儀表板與明細表
+# =============================================================================
 group_tables = {}
 dashboard_items = []
-recent_large_orders = []
-yf_source_count = {"yfinance": 0, "cache": 0, "stale cache": 0, "missing": 0}
+yf_source_count = {
+    "yfinance": 0,
+    "cache": 0,
+    "stale cache": 0,
+    "missing": 0,
+}
 
 for group_name, stocks in st.session_state.stock_groups.items():
     rows = []
-    large_order_count = 0
-    large_buy_count = 0
-    large_sell_count = 0
     pct_hit_count = 0
     known_pct_count = 0
     up_count = 0
     down_count = 0
     top_pct_items = []
-    group_large_messages = []
 
     for symbol in stocks:
         code = symbol_to_code(symbol)
         stock_name = get_stock_name(symbol)
-        order_status = manager.get_order_status(symbol, st.session_state.large_order_threshold) if manager is not None else {}
-        momentum_signal = manager.get_momentum_signal(
-            symbol,
-            large_order_threshold=st.session_state.large_order_threshold,
-            cumulative_threshold=st.session_state.momentum_cumulative_threshold,
-            window_sec=st.session_state.momentum_window_sec,
-            price_pct_threshold=st.session_state.momentum_price_pct,
-        ) if manager is not None else {"active": False, "text": "監控中"}
-        qualifying_orders = manager.get_recent_large_orders(symbol, st.session_state.large_order_threshold, limit=20) if manager is not None else []
-        tick_vol = order_status.get("real_tick_volume")
-        current_price = order_status.get("last_ws_price")
+
+        tick_status = manager.get_tick_status(symbol) if manager is not None else {}
+
+        tick_vol = tick_status.get("real_tick_volume")
+        current_price = tick_status.get("last_ws_price")
+        trade_type = tick_status.get("last_trade_type", "-")
+        total_buy_vol = int(tick_status.get("total_buy_vol", 0) or 0)
+        total_sell_vol = int(tick_status.get("total_sell_vol", 0) or 0)
+
         yesterday_close, close_date, yf_source = get_yfinance_yesterday_close(symbol)
+
         if yf_source in yf_source_count:
             yf_source_count[yf_source] += 1
         elif yesterday_close is None:
             yf_source_count["missing"] += 1
 
         change_pct = None
+
         if current_price is not None and yesterday_close is not None and yesterday_close > 0:
             change_pct = (float(current_price) / float(yesterday_close) - 1) * 100
 
-        large_text = order_status.get("large_order_text", "監控中")
-        if large_text != "監控中" and change_pct is not None:
-            large_text = f"{large_text}｜{format_pct_value(change_pct)}"
-        latest = order_status.get("latest_large_order")
-        trade_type = order_status.get("last_trade_type", "-")
-        momentum_text = momentum_signal.get("text", "監控中")
-        if momentum_signal.get("active"):
-            signal_msg = {
-                "group": group_name,
-                "code": code,
-                "name": stock_name,
-                "text": momentum_text,
-                "time": momentum_signal.get("time"),
-                "pct": change_pct,
-                "type": "秒級拉抬",
-            }
-            group_large_messages.append(signal_msg)
-            recent_large_orders.append(signal_msg)
-            queue_momentum_toast(group_name, code, stock_name, momentum_signal, change_pct)
-
         if change_pct is not None:
             known_pct_count += 1
+
             if float(change_pct) > 0:
                 up_count += 1
             elif float(change_pct) < 0:
                 down_count += 1
-            top_pct_items.append({"code": code, "name": stock_name, "pct": float(change_pct)})
+
+            top_pct_items.append({
+                "code": code,
+                "name": stock_name,
+                "pct": float(change_pct),
+            })
+
             if float(change_pct) >= float(pct_threshold):
                 pct_hit_count += 1
-
-        if qualifying_orders:
-            large_order_count += 1
-            if any(o.get("type") == "外盤(買)" for o in qualifying_orders):
-                large_buy_count += 1
-            if any(o.get("type") == "內盤(賣)" for o in qualifying_orders):
-                large_sell_count += 1
-            for order in qualifying_orders[:5]:
-                order_text = manager._format_large_order_text(order)
-                if change_pct is not None:
-                    order_text = f"{order_text}｜{format_pct_value(change_pct)}"
-                msg = {"group": group_name, "code": code, "name": stock_name, "text": order_text, "time": order.get("time"), "pct": change_pct, "type": order.get("type", "-")}
-                group_large_messages.append(msg)
-                recent_large_orders.append(msg)
-                queue_large_buy_toast(group_name, code, stock_name, order, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
             "股票名稱": stock_name,
-            "大單追蹤": large_text,
-            "秒級拉抬": momentum_text,
-            "符合門檻筆數": len(qualifying_orders),
             "即時價": format_price_value(current_price),
             "漲幅%": format_pct_value(change_pct),
             "最新單筆": "-" if tick_vol is None else f"{tick_vol} 張",
             "內外盤": trade_type,
-            "外盤累積": int(order_status.get("total_buy_vol", 0) or 0),
-            "內盤累積": int(order_status.get("total_sell_vol", 0) or 0),
+            "外盤累積": total_buy_vol,
+            "內盤累積": total_sell_vol,
             "昨收日期": close_date or "-",
             "昨收來源": yf_source,
         })
 
     top_pct_items.sort(key=lambda x: x["pct"], reverse=True)
+
     top_pct_text = "｜".join([
-        f'<span class="{pct_class(item["pct"])}">{escape_html(item["code"])} {escape_html(item["name"])} {item["pct"]:+.2f}%</span>'
+        (
+            f'<span class="{pct_class(item["pct"])}">'
+            f'{escape_html(item["code"])} {escape_html(item["name"])} {item["pct"]:+.2f}%'
+            f'</span>'
+        )
         for item in top_pct_items[:3]
     ]) or "尚無漲幅資料"
 
-    group_large_messages.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
-    large_msg_text = "<br>".join([
-        f'▸ {escape_html(item["code"])} {escape_html(item["name"])}：{escape_html(item["text"])}'
-        for item in group_large_messages[:3]
-    ]) or "尚無大單"
-
     pct_hit_ratio = (pct_hit_count / len(stocks) * 100) if len(stocks) else 0
+
     dashboard_items.append({
         "group": group_name,
         "total": len(stocks),
-        "large_order_count": large_order_count,
-        "large_buy_count": large_buy_count,
-        "large_sell_count": large_sell_count,
         "pct_hit_count": pct_hit_count,
         "known_pct_count": known_pct_count,
         "pct_hit_ratio": pct_hit_ratio,
         "up_count": up_count,
         "down_count": down_count,
         "top_pct_text": top_pct_text,
-        "large_msg_text": large_msg_text,
     })
-    group_tables[group_name] = pd.DataFrame(rows, columns=["代碼", "股票名稱", "大單追蹤", "秒級拉抬", "符合門檻筆數", "即時價", "漲幅%", "最新單筆", "內外盤", "外盤累積", "內盤累積", "昨收日期", "昨收來源"])
 
-# 顯示本輪掃描到的大單買入 toast
-show_pending_toasts()
+    group_tables[group_name] = pd.DataFrame(
+        rows,
+        columns=[
+            "代碼",
+            "股票名稱",
+            "即時價",
+            "漲幅%",
+            "最新單筆",
+            "內外盤",
+            "外盤累積",
+            "內盤累積",
+            "昨收日期",
+            "昨收來源",
+        ],
+    )
 
-# ===== 儀表板 =====
-st.markdown('<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
-st.markdown("### 📌 大單追蹤儀表板")
-st.caption(
-    f"大單門檻：單筆 ≥ {st.session_state.large_order_threshold} 張｜"
-    f"秒級拉抬：{st.session_state.momentum_window_sec}秒內外盤大單累積 ≥ {st.session_state.momentum_cumulative_threshold} 張，"
-    f"拉抬 ≥ {float(st.session_state.momentum_price_pct):.1f}%｜"
-    f"漲幅達標門檻：≥ {pct_threshold:.1f}%｜yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC//60} 分鐘"
+
+# =============================================================================
+# 儀表板
+# =============================================================================
+st.markdown(
+    '<div id="dashboard-top" style="scroll-margin-top: 90px;"></div>',
+    unsafe_allow_html=True,
 )
-st.caption(f"昨收來源統計：yfinance 即時更新 {yf_source_count['yfinance']} 檔｜快取 {yf_source_count['cache']} 檔｜舊快取 {yf_source_count['stale cache']} 檔｜缺資料 {yf_source_count['missing']} 檔")
+
+st.markdown("### 📌 即時漲幅儀表板")
+
+st.caption(
+    f"漲幅達標門檻：≥ {pct_threshold:.1f}%｜"
+    f"yfinance 昨收快取：{YF_CLOSE_CACHE_TTL_SEC // 60} 分鐘"
+)
+
+st.caption(
+    f"昨收來源統計："
+    f"yfinance 即時更新 {yf_source_count['yfinance']} 檔｜"
+    f"快取 {yf_source_count['cache']} 檔｜"
+    f"舊快取 {yf_source_count['stale cache']} 檔｜"
+    f"缺資料 {yf_source_count['missing']} 檔"
+)
+
 
 card_html_parts = ['<div class="dashboard-grid">']
+
 for item in dashboard_items:
     pct_ratio = float(item.get("pct_hit_ratio", 0) or 0)
+
     if pct_ratio >= 70:
         card_class = "dash-card pct-high"
     elif pct_ratio >= 40:
@@ -1633,45 +1659,51 @@ for item in dashboard_items:
         card_class = "dash-card pct-low"
     else:
         card_class = "dash-card pct-zero"
+
     anchor_id = make_anchor_id(item["group"])
+
     card_html_parts.append(
-        f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])} 明細表；大數字 = 漲幅達標檔數 / 分組總檔數">'
+        f'#{anchor_id} 明細表；大數字 = 漲幅達標檔數 / 分組總檔數">'
         f'<div class="{card_class}">'
         f'<div class="dash-title">{escape_html(item["group"])}</div>'
         f'<div class="dash-big">{item["pct_hit_count"]} / {item["total"]}</div>'
-        f'<div class="dash-line">漲幅達標比例（≥{pct_threshold:.1f}%）：<b>{item["pct_hit_ratio"]:.0f}%</b></div>'
-        f'<div class="dash-line">🎯 達標：<b>{item["pct_hit_count"]}</b> 檔（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
-        f'<div class="dash-line">🔴 一般上漲：<b>{item["up_count"]}</b>　🟢 下跌：<b>{item["down_count"]}</b></div>'
-        f'<div class="dash-line">🚀 外盤大單：<b>{item["large_buy_count"]}</b>　📉 內盤大單：<b>{item["large_sell_count"]}</b></div>'
-        f'<div class="dash-small"><b>大單追蹤</b><br>{item["large_msg_text"]}</div>'
+        f'<div class="dash-line">漲幅達標比例（≥{pct_threshold:.1f}%）：'
+        f'<b>{item["pct_hit_ratio"]:.0f}%</b></div>'
+        f'<div class="dash-line">🎯 達標：<b>{item["pct_hit_count"]}</b> 檔'
+        f'（有漲幅資料 {item["known_pct_count"]} 檔）</div>'
+        f'<div class="dash-line">🔴 一般上漲：<b>{item["up_count"]}</b>　'
+        f'🟢 下跌：<b>{item["down_count"]}</b></div>'
         f'<div class="dash-small"><b>漲幅排行</b><br>{item["top_pct_text"]}</div>'
         f'</div></a>'
     )
-card_html_parts.append('</div>')
-st.markdown("".join(card_html_parts), unsafe_allow_html=True)
 
-recent_large_orders.sort(key=lambda x: x["time"] or datetime.min.replace(tzinfo=TW_TZ), reverse=True)
-st.caption(f"本輪以目前門檻 ≥ {int(st.session_state.large_order_threshold)} 張掃到的大單筆數：{len(recent_large_orders)} 筆")
-if recent_large_orders:
-    st.markdown("#### 🔔 最近大單訊息")
-    recent_cols = st.columns(min(3, len(recent_large_orders)))
-    for idx, item in enumerate(recent_large_orders[:6]):
-        with recent_cols[idx % len(recent_cols)]:
-            st.info(f"{item['group']}｜{item['code']} {item['name']}\n\n{item['text']}")
+card_html_parts.append("</div>")
+
+st.markdown("".join(card_html_parts), unsafe_allow_html=True)
 
 st.divider()
 
-# ===== 明細表 =====
+
+# =============================================================================
+# 明細表
+# =============================================================================
 for group_name, display_df in group_tables.items():
     anchor_id = make_anchor_id(group_name)
-    st.markdown(f'<div id="{anchor_id}" style="scroll-margin-top: 90px;"></div>', unsafe_allow_html=True)
+
+    st.markdown(
+        f'<div id="{anchor_id}" style="scroll-margin-top: 90px;"></div>',
+        unsafe_allow_html=True,
+    )
+
     table_header_col1, table_header_col2 = st.columns([8, 2])
+
     with table_header_col1:
         st.subheader(f"【{group_name}】({len(display_df)}檔)")
+
     with table_header_col2:
         st.markdown(
             '<div style="text-align:right; padding-top: 0.6rem;">'
-            '<a href="#dashboard-top">⬆️ 返回儀表板</a>'
+            '#dashboard-top⬆️ 返回儀表板</a>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -1681,13 +1713,24 @@ for group_name, display_df in group_tables.items():
         width="stretch",
         hide_index=True,
         column_config={
-            "代碼": st.column_config.LinkColumn("代碼", help="點擊前往 Yahoo 台股個股頁", display_text=r"https://tw.stock.yahoo.com/quote/(.*)"),
+            "代碼": st.column_config.LinkColumn(
+                "代碼",
+                help="點擊前往 Yahoo 台股個股頁",
+                display_text=r"https://tw.stock.yahoo.com/quote/(.*)",
+            ),
             "股票名稱": st.column_config.TextColumn("股票名稱"),
-            "大單追蹤": st.column_config.TextColumn("大單追蹤", help="達到大單門檻時顯示最近一筆大單時間、張數、價格、內外盤與漲幅"),
-            "符合門檻筆數": st.column_config.NumberColumn("符合門檻筆數", help="最近 200 筆單筆成交中，符合目前大單門檻的筆數；門檻 5 時，5 張以上都會計入"),
-            "即時價": st.column_config.TextColumn("即時價", help="由富邦 WebSocket trades 即時成交價取得"),
-            "漲幅%": st.column_config.TextColumn("漲幅%", help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1"),
-            "最新單筆": st.column_config.TextColumn("最新單筆", help="由累積成交量差值換算，不再直接顯示累積成交量"),
+            "即時價": st.column_config.TextColumn(
+                "即時價",
+                help="由富邦 WebSocket trades 即時成交價取得",
+            ),
+            "漲幅%": st.column_config.TextColumn(
+                "漲幅%",
+                help="富邦 WebSocket 即時價 / yfinance 昨日收盤價 - 1",
+            ),
+            "最新單筆": st.column_config.TextColumn(
+                "最新單筆",
+                help="優先使用 size；若無 size，則由累積成交量差值換算",
+            ),
             "內外盤": st.column_config.TextColumn("內外盤"),
             "外盤累積": st.column_config.NumberColumn("外盤累積"),
             "內盤累積": st.column_config.NumberColumn("內盤累積"),
@@ -1696,15 +1739,28 @@ for group_name, display_df in group_tables.items():
         },
     )
 
+
+# =============================================================================
+# Debug
+# =============================================================================
 with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
     debug_code = st.text_input("輸入代碼看最後 WS 原始訊息", value="2330")
     msg = manager.get_message(debug_code)
+
     if msg:
         st.caption(f"時間：{msg['time'].strftime('%Y-%m-%d %H:%M:%S')}")
         st.json(msg["raw"])
     else:
         st.caption("尚未收到此代碼的 WebSocket 訊息")
 
-if st.session_state.auto_refresh_enabled and not st.session_state.group_editor_unlocked and not st.session_state.editing_mode:
+
+# =============================================================================
+# 自動刷新
+# =============================================================================
+if (
+    st.session_state.auto_refresh_enabled
+    and not st.session_state.group_editor_unlocked
+    and not st.session_state.editing_mode
+):
     time.sleep(int(st.session_state.refresh_sec))
     st.rerun()
