@@ -2418,7 +2418,10 @@ else:
     st.markdown("## 🚀 盤中瞬間拉抬進場監控")
 
 
-control_cols = st.columns(14)
+# =============================================================================
+# 主畫面頂端控制列 (僅保留基本操作與漲幅門檻)
+# =============================================================================
+control_cols = st.columns(5) # 將原本的 14 欄縮減為 5 欄
 
 with control_cols[0]:
     if st.button("🔄 手動刷新", width="stretch"):
@@ -2451,149 +2454,35 @@ with control_cols[4]:
         step=0.5,
     )
 
-with control_cols[5]:
-    st.number_input(
-        "量能視窗秒",
-        min_value=5,
-        max_value=120,
-        step=5,
-        key="entry_bucket_sec",
-    )
+# =============================================================================
+# 左側欄位：參數設定區塊 (合併所有紅框處的設定)
+# =============================================================================
+with st.sidebar.expander("⚙️ 參數設定", expanded=True):
+    
+    st.markdown("**🚀 進場預警參數**")
+    st.number_input("量能視窗秒", min_value=5, max_value=120, step=5, key="entry_bucket_sec")
+    st.number_input("高低點追蹤秒", min_value=10, max_value=300, step=10, key="entry_track_sec")
+    st.number_input("量比門檻", min_value=0.1, max_value=10.0, step=0.1, key="entry_volume_ratio")
+    st.number_input("價格變動%", min_value=0.1, max_value=10.0, step=0.1, key="entry_price_move_pct")
+    st.number_input("外盤占比", min_value=0.0, max_value=1.0, step=0.05, key="entry_buy_pressure_ratio", help="0.55 = 外盤占比 55%")
+    st.number_input("最低本段量", min_value=0, max_value=10000, step=10, key="entry_min_current_volume")
+    st.number_input("冷卻秒數", min_value=0, max_value=300, step=5, key="entry_cooldown_sec")
+    st.number_input("2秒預警%", min_value=0.1, max_value=5.0, step=0.1, key="entry_early_2s_pct", help="極短窗口漲幅門檻，比5秒窗更快抓到瞬間拉抬")
+    st.number_input("單筆跳動%", min_value=0.1, max_value=5.0, step=0.1, key="entry_tick_jump_pct", help="最新一筆成交價相較上一筆的漲幅，抓單筆巨量瞬間跳價（🔥極早期訊號用）")
+    st.number_input("視窗最少筆數", min_value=1, max_value=20, step=1, key="entry_min_ticks_in_bucket", help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發")
 
-with control_cols[6]:
-    st.number_input(
-        "高低點追蹤秒",
-        min_value=10,
-        max_value=300,
-        step=10,
-        key="entry_track_sec",
-    )
+    st.markdown("---")
+    st.markdown("**📈 今日低點反彈提醒**")
+    st.caption("純看價格、不看量能")
+    st.number_input("低點反彈%", min_value=0.1, max_value=20.0, step=0.5, key="day_low_rebound_pct", help="現價相較今日最低點反彈達此幅度即觸發📈提醒")
+    st.number_input("反彈冷卻秒數", min_value=0, max_value=600, step=10, key="day_low_rebound_cooldown_sec", help="同一檔股票的低點反彈提醒最短間隔，避免在低點附近來回震盪時洗版")
 
-with control_cols[7]:
-    st.number_input(
-        "量比門檻",
-        min_value=0.1,
-        max_value=10.0,
-        step=0.1,
-        key="entry_volume_ratio",
-    )
-
-with control_cols[8]:
-    st.number_input(
-        "價格變動%",
-        min_value=0.1,
-        max_value=10.0,
-        step=0.1,
-        key="entry_price_move_pct",
-    )
-
-with control_cols[9]:
-    st.number_input(
-        "外盤占比",
-        min_value=0.0,
-        max_value=1.0,
-        step=0.05,
-        key="entry_buy_pressure_ratio",
-        help="0.55 = 外盤占比 55%",
-    )
-
-with control_cols[10]:
-    st.number_input(
-        "最低本段量",
-        min_value=0,
-        max_value=10000,
-        step=10,
-        key="entry_min_current_volume",
-    )
-
-with control_cols[11]:
-    st.number_input(
-        "冷卻秒數",
-        min_value=0,
-        max_value=300,
-        step=5,
-        key="entry_cooldown_sec",
-    )
-
-with control_cols[12]:
-    st.number_input(
-        "2秒預警%",
-        min_value=0.1,
-        max_value=5.0,
-        step=0.1,
-        key="entry_early_2s_pct",
-        help="極短窗口漲幅門檻，比5秒窗更快抓到瞬間拉抬",
-    )
-
-with control_cols[13]:
-    st.number_input(
-        "單筆跳動%",
-        min_value=0.1,
-        max_value=5.0,
-        step=0.1,
-        key="entry_tick_jump_pct",
-        help="最新一筆成交價相較上一筆的漲幅，抓單筆巨量瞬間跳價（🔥極早期訊號用）",
-    )
-
-# 把最後一欄收納到 sidebar 或以其餘空間處理，因為加了推播開關推移了一格，
-# 不過 Streamlit 預設會自動流動控制列寬度。
-st.sidebar.markdown("---")
-st.sidebar.number_input(
-    "視窗最少筆數",
-    min_value=1,
-    max_value=20,
-    step=1,
-    key="entry_min_ticks_in_bucket",
-    help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發",
-)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("**📈 今日低點反彈提醒**")
-st.sidebar.caption("不斷記錄今日最低成交價，現價相較最低點反彈達門檻即提醒，純看價格、不看量能")
-st.sidebar.number_input(
-    "低點反彈%",
-    min_value=0.1,
-    max_value=20.0,
-    step=0.5,
-    key="day_low_rebound_pct",
-    help="現價相較今日最低點反彈達此幅度即觸發📈提醒",
-)
-st.sidebar.number_input(
-    "反彈冷卻秒數",
-    min_value=0,
-    max_value=600,
-    step=10,
-    key="day_low_rebound_cooldown_sec",
-    help="同一檔股票的低點反彈提醒最短間隔，避免在低點附近來回震盪時洗版",
-)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("**📊 區間動能提醒（預設3分鐘漲1.5%）**")
-st.sidebar.caption("固定觀察一段時間窗口的漲幅，抓沒有單筆爆量、但持續緩步走高的走勢")
-st.sidebar.number_input(
-    "動能視窗秒數",
-    min_value=30,
-    max_value=400,
-    step=30,
-    key="momentum_window_sec",
-    help="預設180秒＝3分鐘，可依需求調整觀察窗口長度",
-)
-st.sidebar.number_input(
-    "動能漲幅門檻%",
-    min_value=0.1,
-    max_value=20.0,
-    step=0.1,
-    key="momentum_window_pct",
-    help="視窗內漲幅達此門檻即觸發📊提醒",
-)
-st.sidebar.number_input(
-    "動能冷卻秒數",
-    min_value=0,
-    max_value=600,
-    step=10,
-    key="momentum_cooldown_sec",
-    help="同一檔股票的區間動能提醒最短間隔",
-)
+    st.markdown("---")
+    st.markdown("**📊 區間動能提醒**")
+    st.caption("抓一段時間持續走高的走勢")
+    st.number_input("動能視窗秒數", min_value=30, max_value=400, step=30, key="momentum_window_sec", help="預設180秒＝3分鐘，可依需求調整觀察窗口長度")
+    st.number_input("動能漲幅門檻%", min_value=0.1, max_value=20.0, step=0.1, key="momentum_window_pct", help="視窗內漲幅達此門檻即觸發📊提醒")
+    st.number_input("動能冷卻秒數", min_value=0, max_value=600, step=10, key="momentum_cooldown_sec", help="同一檔股票的區間動能提醒最短間隔")
 
 
 render_fubon_login()
