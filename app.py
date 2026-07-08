@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-盤中即時成交監控 - 純富邦 WebSocket 版
+盤中即時成交監控 - 純富邦 WebSocket 版 (含 Telegram 推送)
 
 目標：
 捕捉股價瞬間拉抬時的進場訊號。
@@ -14,6 +14,7 @@
 6. 使用最近 60 秒高低點追蹤，判斷突破高點或從低點急拉。
 7. 分成「預警」與「進場訊號」。
 8. 修正儀表板 HTML anchor UI 問題。
+9. 新增 Telegram 推送功能 (僅推送預警與進場訊號)。
 """
 
 import os
@@ -24,6 +25,7 @@ import time
 import base64
 import tempfile
 import threading
+import requests  # 新增：用於發送 Telegram 請求
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -1070,16 +1072,16 @@ class FubonRealtimeManager:
         return total
 
     def _price_at_or_before(self, price_points, target_ts):
-        """
-        取得「在 target_ts 當下」真正有效的成交價，也就是時間 <= target_ts
-        的最後一筆成交。這是計算「N 秒前價格」正確的做法：
-        如果某檔股票冷清一陣子（例如 8 秒沒成交），然後突然爆量急拉，
-        用「>= target_ts 的第一筆」當基準會抓到剛好是急拉的那一筆本身，
-        導致漲幅算出來是 0%，完全抓不到訊號。
-        改用「<= target_ts 的最後一筆」，急拉前最後成交價才是正確基準。
-        若真的完全沒有更早的資料（剛開始監控），則退而求其次用
-        目前手上最早的一筆價格做近似基準，避免直接回傳 None 而漏掉訊號。
-        """
+           
+                                                                                               
+                                                                                  
+                                                                                                  
+                                                                                                
+                                                              
+                                                                                                
+                                                                                         
+                                                                                                     
+           
         before = None
         earliest = None
 
@@ -1120,11 +1122,11 @@ class FubonRealtimeManager:
         return (float(current_price) / float(base_price) - 1) * 100
 
     def _last_tick_jump_pct(self, recent_ticks, current_price):
-        """
-        單筆跳動幅度：目前成交價 相對於「上一筆成交價」的漲幅。
-        用來抓最極端的狀況——一筆大單直接把價格瞬間打上去，
-        連 2 秒窗口都還沒等到就該提示的情況。
-        """
+           
+                                                                                          
+                                                                                      
+                                                              
+           
         if current_price is None:
             return None
 
@@ -1237,10 +1239,10 @@ class FubonRealtimeManager:
         bucket_start_ts = int(now_ts // bucket_sec) * bucket_sec
         previous_bucket_start_ts = bucket_start_ts - bucket_sec
 
-        # 視窗剛開始的 1~2 秒，分母太小會讓「預估量」被單一大單放大成離譜倍數
-        # （例如視窗才過 1 秒就來一張大單，除以 1 秒再乘 30 秒 = 30 倍量），
-        # 因此用 BUCKET_ELAPSED_FLOOR_SEC 當作分母下限，避免早期雜訊誤觸發，
-        # 同時仍保留「不用等滿一個視窗才反應」的即時性。
+                                                                                                            
+                                                                                                     
+                                                                                                
+                                                                               
         elapsed_in_bucket = max(BUCKET_ELAPSED_FLOOR_SEC, now_ts - bucket_start_ts)
 
         current_volume = self._sum_tick_volume(
@@ -1282,9 +1284,9 @@ class FubonRealtimeManager:
                 and enough_ticks
             )
         elif current_volume >= min_current_volume and enough_ticks:
-            # 前一個視窗完全沒有成交（前段量=0），代表這檔股票原本很冷清。
-            # 這種「從 0 突然噴量」正是最典型的急拉起漲點，不能因為
-            # 分母是 0 算不出量比就放棄判斷，改用「本段量已達最低門檻」直接視為量能達標。
+                                                                                                       
+                                                                                            
+                                                                                                                             
             volume_ok = True
 
         buy_pressure_ratio = None
@@ -1389,7 +1391,7 @@ class FubonRealtimeManager:
         # 🔥 極早期訊號（flash）：完全不等視窗量比、也不等 60 秒高低點確認，
         # 只要「最新一筆是外盤買」且「單筆跳動」或「2 秒漲幅」已經達標，
         # 就先跳出來提醒。這是三層裡反應最快的一層，代價是雜訊也最多，
-        # 只在還沒達到 warning / entry 時才顯示，避免蓋掉更有把握的訊號。
+        # 只在還沒達到 warning / entry 時才顯示，避免蓋掉更有把握的訊號。                                                                                                                                                                                                                                                                                                            
         flash_active = (
             not entry_active
             and not warning_active
@@ -1537,25 +1539,95 @@ def save_backup_snapshot(groups):
 
 
 # =============================================================================
+# Telegram 推送功能
+# =============================================================================
+def get_telegram_config():
+    try:
+        bot_token = st.secrets["telegram"]["bot_token"]
+        chat_id = st.secrets["telegram"]["chat_id"]
+        return bot_token, chat_id
+    except Exception:
+        return None, None
+
+def send_telegram_message(bot_token, chat_id, message_text):
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message_text,
+        "parse_mode": "HTML"
+    }
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        pass  # 靜默處理，避免阻斷主線程運作
+
+def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
+    if not signal:
+        return
+
+    level = signal.get("signal_level", "none")
+    
+    # 限制只推送「預警」與「進場訊號」
+    if level not in ("warning", "entry"):
+        return
+
+    signal_key = signal.get("signal_key")
+    if not signal_key:
+        return
+
+    pushed_keys = st.session_state.telegram_pushed_keys
+    if signal_key in pushed_keys:
+        return
+
+    pushed_keys.add(signal_key)
+    # 控制狀態大小避免溢出
+    if len(pushed_keys) > 2000:
+        st.session_state.telegram_pushed_keys = set(list(pushed_keys)[-1000:])
+
+    bot_token, chat_id = get_telegram_config()
+    if not bot_token or not chat_id:
+        return
+
+    signal_time = signal.get("time")
+    time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
+    price_text = format_price_value(signal.get("current_price"))
+    pct_text = format_pct_value(change_pct)
+
+    prefix = "🚀 <b>[進場訊號]</b>" if level == "entry" else "⚠️ <b>[預警]</b>"
+
+    msg = (
+        f"{prefix}\n"
+        f"<b>{group_name}｜{code} {stock_name}</b>\n"
+        f"現價：{price_text}｜漲幅：{pct_text}\n"
+        f"時間：{time_text}\n"
+        f"------------------\n"
+        f"{signal.get('text', '')}"
+    )
+
+    # 放到 Thread 背景執行，避免請求網路拖慢主程式
+    threading.Thread(target=send_telegram_message, args=(bot_token, chat_id, msg)).start()
+
+
+# =============================================================================
 # 每日訊號 Log
 # =============================================================================
 def get_signal_log_path(for_date=None):
-    """
-    每天一個檔案，檔名帶日期，例如 signal_logs/log_20260708.txt。
-    這樣「今天的 log.txt」不會被昨天的紀錄洗掉，也方便之後回顧某一天的訊號。
-    """
+       
+                                                                                 
+                                                                                                            
+       
     day = for_date or datetime.now(TW_TZ)
     os.makedirs(SIGNAL_LOG_DIR, exist_ok=True)
     return os.path.join(SIGNAL_LOG_DIR, f"log_{day.strftime('%Y%m%d')}.txt")
 
 
 def append_signal_log(group_name, code, stock_name, signal, change_pct):
-    """
-    把一筆訊號（🔥極早期 / ⚠️預警 / 🚀進場）寫進當天的 log 檔。
-    用 signal_key 搭配 session_state 做去重，避免同一個訊號在自動刷新
-    期間被重複寫入同一行好幾次；不同 session（例如重開瀏覽器分頁）
-    仍會各自記一次，但這對「當天完整留存訊號紀錄」的目的影響不大。
-    """
+       
+                                                                                            
+                                                                                        
+                                                                                             
+                                                                                                 
+       
     if not signal:
         return
 
@@ -1597,7 +1669,7 @@ def append_signal_log(group_name, code, stock_name, signal, change_pct):
                 f.write(line + "\n")
 
     except Exception as e:
-        # log 寫入失敗不該讓整個監控頁面掛掉，記到 session_state 讓 UI 可以提示錯誤即可
+                                                                                                                  
         st.session_state["signal_log_write_error"] = str(e)
 
 
@@ -1615,6 +1687,7 @@ def read_signal_log(for_date=None):
 
 
 
+# Session State 初始化
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = True
 
@@ -1691,6 +1764,10 @@ if "entry_signal_toast_keys" not in st.session_state:
 
 if "_entry_signal_toast_messages" not in st.session_state:
     st.session_state._entry_signal_toast_messages = []
+
+# 初始化 telegram 訊息去重記錄
+if "telegram_pushed_keys" not in st.session_state:
+    st.session_state.telegram_pushed_keys = set()
 
 
 def show_pending_toasts():
@@ -2272,7 +2349,8 @@ st.info(
     "🔥 極早期訊號：最新一筆是外盤買，且單筆跳動或2秒漲幅已達標，最快、雜訊也最多，僅供提早注意。\n"
     "⚠️ 預警：量能達標＋外盤占比達標＋2/5/10秒任一短線漲幅達標。\n"
     "🚀 進場訊號：預警條件全部成立，再加上30秒漲幅或60秒突破高點/低點急拉確認，並通過冷卻時間。\n"
-    "（已修正：前段量為0時的爆量偵測、5/10/30秒漲幅的基準價計算bug、視窗剛開始時預估量被單筆大單誤放大的問題）"
+    "（已修正：前段量為0時的爆量偵測、5/10/30秒漲幅的基準價計算bug、視窗剛開始時預估量被單筆大單誤放大的問題）\n"
+    "🔔 Telegram 推送：只推送「預警」與「進場訊號」至綁定的群組。"
 )
 
 st.caption(
@@ -2399,8 +2477,12 @@ for group_name, stocks in st.session_state.stock_groups.items():
 
             group_signal_messages.append(signal_msg)
             recent_signals.append(signal_msg)
+            
             queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct)
             append_signal_log(group_name, code, stock_name, signal, change_pct)
+            
+            # --- 觸發 Telegram 推送 ---
+            push_telegram_signal(group_name, code, stock_name, signal, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
