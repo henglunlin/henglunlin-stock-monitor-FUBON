@@ -14,7 +14,7 @@
 6. 使用最近 60 秒高低點追蹤，判斷突破高點或從低點急拉。
 7. 分成「預警」與「進場訊號」。
 8. 修正儀表板 HTML anchor UI 問題。
-9. 新增 Telegram 推送功能 (僅推送預警與進場訊號)。
+9. 整合 Telegram 推播開關與 st.secrets 預設值讀取功能。
 """
 
 import os
@@ -25,12 +25,13 @@ import time
 import base64
 import tempfile
 import threading
-import requests  # 新增：用於發送 Telegram 請求
+import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 try:
     from fubon_neo.sdk import FubonSDK
@@ -73,14 +74,9 @@ DEFAULT_BUY_PRESSURE_RATIO = 0.55
 DEFAULT_SIGNAL_COOLDOWN_SEC = 45
 DEFAULT_MIN_CURRENT_VOLUME = 20
 
-# --- 急漲即時偵測新增參數 ---
-# 2 秒極短窗口漲幅門檻（用來抓最快速的瞬間拉抬，比 5 秒窗更靈敏）
 DEFAULT_EARLY_2S_PCT = 0.5
-# 單筆跳動門檻：最新一筆成交價相較「前一筆成交價」的漲幅，抓單筆巨量瞬間跳價
 DEFAULT_TICK_JUMP_PCT = 0.5
-# 量能視窗內至少要有幾筆成交，避免單一大單假突破
 DEFAULT_MIN_TICKS_IN_BUCKET = 2
-# 量能視窗投影時，經過秒數的下限，避免視窗剛開始 1~2 秒就被單筆巨量放大成離譜倍數
 BUCKET_ELAPSED_FLOOR_SEC = 3.0
 
 DEFAULT_STOCK_GROUPS = {
@@ -94,6 +90,21 @@ DEFAULT_STOCK_GROUPS = {
     ],
 }
 
+# =============================================================================
+# Secrets & Telegram 設定
+# =============================================================================
+def get_secret_or_default(key: str, default: str = "") -> str:
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+        if "telegram" in st.secrets and key in st.secrets["telegram"]:
+            return st.secrets["telegram"][key]
+    except Exception:
+        pass
+    return os.environ.get(key, default)
+
+TELEGRAM_BOT_TOKEN = get_secret_or_default("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
 
 # =============================================================================
 # CSS
@@ -1072,16 +1083,6 @@ class FubonRealtimeManager:
         return total
 
     def _price_at_or_before(self, price_points, target_ts):
-           
-                                                                                               
-                                                                                  
-                                                                                                  
-                                                                                                
-                                                              
-                                                                                                
-                                                                                         
-                                                                                                     
-           
         before = None
         earliest = None
 
@@ -1122,11 +1123,6 @@ class FubonRealtimeManager:
         return (float(current_price) / float(base_price) - 1) * 100
 
     def _last_tick_jump_pct(self, recent_ticks, current_price):
-           
-                                                                                          
-                                                                                      
-                                                              
-           
         if current_price is None:
             return None
 
@@ -1239,10 +1235,6 @@ class FubonRealtimeManager:
         bucket_start_ts = int(now_ts // bucket_sec) * bucket_sec
         previous_bucket_start_ts = bucket_start_ts - bucket_sec
 
-                                                                                                            
-                                                                                                     
-                                                                                                
-                                                                               
         elapsed_in_bucket = max(BUCKET_ELAPSED_FLOOR_SEC, now_ts - bucket_start_ts)
 
         current_volume = self._sum_tick_volume(
@@ -1284,9 +1276,6 @@ class FubonRealtimeManager:
                 and enough_ticks
             )
         elif current_volume >= min_current_volume and enough_ticks:
-                                                                                                       
-                                                                                            
-                                                                                                                             
             volume_ok = True
 
         buy_pressure_ratio = None
@@ -1388,10 +1377,6 @@ class FubonRealtimeManager:
             and cooldown_ok
         )
 
-        # 🔥 極早期訊號（flash）：完全不等視窗量比、也不等 60 秒高低點確認，
-        # 只要「最新一筆是外盤買」且「單筆跳動」或「2 秒漲幅」已經達標，
-        # 就先跳出來提醒。這是三層裡反應最快的一層，代價是雜訊也最多，
-        # 只在還沒達到 warning / entry 時才顯示，避免蓋掉更有把握的訊號。                                                                                                                                                                                                                                                                                                            
         flash_active = (
             not entry_active
             and not warning_active
@@ -1541,33 +1526,33 @@ def save_backup_snapshot(groups):
 # =============================================================================
 # Telegram 推送功能
 # =============================================================================
-def get_telegram_config():
-    try:
-        bot_token = st.secrets["telegram"]["bot_token"]
-        chat_id = st.secrets["telegram"]["chat_id"]
-        return bot_token, chat_id
-    except Exception:
-        return None, None
-
-def send_telegram_message(bot_token, chat_id, message_text):
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+def send_telegram_message(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,
-        "text": message_text,
-        "parse_mode": "HTML"
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code != 200:
+            st.error(f"Telegram 傳送失敗，API 回傳：{res.text}")
     except Exception as e:
-        pass  # 靜默處理，避免阻斷主線程運作
+        st.error(f"Telegram 連線失敗: {e}")
 
 def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
+    # 檢查開關是否開啟
+    if not st.session_state.tg_push_enabled:
+        return
+
     if not signal:
         return
 
     level = signal.get("signal_level", "none")
     
-    # 限制只推送「預警」與「進場訊號」
     if level not in ("warning", "entry"):
         return
 
@@ -1580,13 +1565,8 @@ def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
         return
 
     pushed_keys.add(signal_key)
-    # 控制狀態大小避免溢出
     if len(pushed_keys) > 2000:
         st.session_state.telegram_pushed_keys = set(list(pushed_keys)[-1000:])
-
-    bot_token, chat_id = get_telegram_config()
-    if not bot_token or not chat_id:
-        return
 
     signal_time = signal.get("time")
     time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
@@ -1604,30 +1584,22 @@ def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
         f"{signal.get('text', '')}"
     )
 
-    # 放到 Thread 背景執行，避免請求網路拖慢主程式
-    threading.Thread(target=send_telegram_message, args=(bot_token, chat_id, msg)).start()
+    # 利用 Thread 傳送避免阻塞介面，並且注入 context 讓 st.error 可以在背景正常運作
+    t = threading.Thread(target=send_telegram_message, args=(msg,))
+    add_script_run_ctx(t)
+    t.start()
 
 
 # =============================================================================
 # 每日訊號 Log
 # =============================================================================
 def get_signal_log_path(for_date=None):
-       
-                                                                                 
-                                                                                                            
-       
     day = for_date or datetime.now(TW_TZ)
     os.makedirs(SIGNAL_LOG_DIR, exist_ok=True)
     return os.path.join(SIGNAL_LOG_DIR, f"log_{day.strftime('%Y%m%d')}.txt")
 
 
 def append_signal_log(group_name, code, stock_name, signal, change_pct):
-       
-                                                                                            
-                                                                                        
-                                                                                             
-                                                                                                 
-       
     if not signal:
         return
 
@@ -1669,7 +1641,6 @@ def append_signal_log(group_name, code, stock_name, signal, change_pct):
                 f.write(line + "\n")
 
     except Exception as e:
-                                                                                                                  
         st.session_state["signal_log_write_error"] = str(e)
 
 
@@ -1686,13 +1657,15 @@ def read_signal_log(for_date=None):
         return f"讀取 log 失敗：{e}", log_path
 
 
-
 # Session State 初始化
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = True
 
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
+
+if "tg_push_enabled" not in st.session_state:
+    st.session_state.tg_push_enabled = False
 
 if "entry_bucket_sec" not in st.session_state:
     st.session_state.entry_bucket_sec = DEFAULT_ENTRY_BUCKET_SEC
@@ -1765,7 +1738,6 @@ if "entry_signal_toast_keys" not in st.session_state:
 if "_entry_signal_toast_messages" not in st.session_state:
     st.session_state._entry_signal_toast_messages = []
 
-# 初始化 telegram 訊息去重記錄
 if "telegram_pushed_keys" not in st.session_state:
     st.session_state.telegram_pushed_keys = set()
 
@@ -2188,6 +2160,12 @@ with control_cols[1]:
     st.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
 
 with control_cols[2]:
+    tg_push = st.toggle("📲 Telegram 推播", value=st.session_state.tg_push_enabled, help="必須開啟此選項，機器人才會發送推播")
+    if tg_push != st.session_state.tg_push_enabled:
+        st.session_state.tg_push_enabled = tg_push
+        st.rerun()
+
+with control_cols[3]:
     st.number_input(
         "刷新秒數",
         min_value=1,
@@ -2196,7 +2174,7 @@ with control_cols[2]:
         key="refresh_sec",
     )
 
-with control_cols[3]:
+with control_cols[4]:
     pct_threshold = st.number_input(
         "漲幅門檻%",
         min_value=0.0,
@@ -2205,7 +2183,7 @@ with control_cols[3]:
         step=0.5,
     )
 
-with control_cols[4]:
+with control_cols[5]:
     st.number_input(
         "量能視窗秒",
         min_value=5,
@@ -2214,7 +2192,7 @@ with control_cols[4]:
         key="entry_bucket_sec",
     )
 
-with control_cols[5]:
+with control_cols[6]:
     st.number_input(
         "高低點追蹤秒",
         min_value=10,
@@ -2223,7 +2201,7 @@ with control_cols[5]:
         key="entry_track_sec",
     )
 
-with control_cols[6]:
+with control_cols[7]:
     st.number_input(
         "量比門檻",
         min_value=0.1,
@@ -2232,7 +2210,7 @@ with control_cols[6]:
         key="entry_volume_ratio",
     )
 
-with control_cols[7]:
+with control_cols[8]:
     st.number_input(
         "價格變動%",
         min_value=0.1,
@@ -2241,7 +2219,7 @@ with control_cols[7]:
         key="entry_price_move_pct",
     )
 
-with control_cols[8]:
+with control_cols[9]:
     st.number_input(
         "外盤占比",
         min_value=0.0,
@@ -2251,7 +2229,7 @@ with control_cols[8]:
         help="0.55 = 外盤占比 55%",
     )
 
-with control_cols[9]:
+with control_cols[10]:
     st.number_input(
         "最低本段量",
         min_value=0,
@@ -2260,7 +2238,7 @@ with control_cols[9]:
         key="entry_min_current_volume",
     )
 
-with control_cols[10]:
+with control_cols[11]:
     st.number_input(
         "冷卻秒數",
         min_value=0,
@@ -2269,7 +2247,7 @@ with control_cols[10]:
         key="entry_cooldown_sec",
     )
 
-with control_cols[11]:
+with control_cols[12]:
     st.number_input(
         "2秒預警%",
         min_value=0.1,
@@ -2279,7 +2257,7 @@ with control_cols[11]:
         help="極短窗口漲幅門檻，比5秒窗更快抓到瞬間拉抬",
     )
 
-with control_cols[12]:
+with control_cols[13]:
     st.number_input(
         "單筆跳動%",
         min_value=0.1,
@@ -2289,15 +2267,17 @@ with control_cols[12]:
         help="最新一筆成交價相較上一筆的漲幅，抓單筆巨量瞬間跳價（🔥極早期訊號用）",
     )
 
-with control_cols[13]:
-    st.number_input(
-        "視窗最少筆數",
-        min_value=1,
-        max_value=20,
-        step=1,
-        key="entry_min_ticks_in_bucket",
-        help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發",
-    )
+# 把最後一欄收納到 sidebar 或以其餘空間處理，因為加了推播開關推移了一格，
+# 不過 Streamlit 預設會自動流動控制列寬度。
+st.sidebar.markdown("---")
+st.sidebar.number_input(
+    "視窗最少筆數",
+    min_value=1,
+    max_value=20,
+    step=1,
+    key="entry_min_ticks_in_bucket",
+    help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發",
+)
 
 
 render_fubon_login()
@@ -2349,7 +2329,6 @@ st.info(
     "🔥 極早期訊號：最新一筆是外盤買，且單筆跳動或2秒漲幅已達標，最快、雜訊也最多，僅供提早注意。\n"
     "⚠️ 預警：量能達標＋外盤占比達標＋2/5/10秒任一短線漲幅達標。\n"
     "🚀 進場訊號：預警條件全部成立，再加上30秒漲幅或60秒突破高點/低點急拉確認，並通過冷卻時間。\n"
-    "（已修正：前段量為0時的爆量偵測、5/10/30秒漲幅的基準價計算bug、視窗剛開始時預估量被單筆大單誤放大的問題）\n"
     "🔔 Telegram 推送：只推送「預警」與「進場訊號」至綁定的群組。"
 )
 
@@ -2744,119 +2723,4 @@ for group_name, display_df in group_tables.items():
                 help="量能視窗內的成交筆數，用來過濾單一大單造成的假突破",
             ),
             "前段量": st.column_config.NumberColumn("前段量"),
-            "預估本段量": st.column_config.NumberColumn("預估本段量"),
-            "量比": st.column_config.TextColumn("量比"),
-            "外盤占比": st.column_config.TextColumn("外盤占比"),
-            "單筆跳動": st.column_config.TextColumn(
-                "單筆跳動",
-                help="最新一筆成交價相較上一筆成交價的漲幅，抓單筆巨量瞬間跳價",
-            ),
-            "2秒漲幅": st.column_config.TextColumn(
-                "2秒漲幅",
-                help="極短窗口漲幅，反應速度比5秒窗更快",
-            ),
-            "5秒漲幅": st.column_config.TextColumn("5秒漲幅"),
-            "10秒漲幅": st.column_config.TextColumn("10秒漲幅"),
-            "30秒漲幅": st.column_config.TextColumn("30秒漲幅"),
-            "60秒低點": st.column_config.TextColumn("60秒低點"),
-            "60秒高點": st.column_config.TextColumn("60秒高點"),
-            "低點拉抬": st.column_config.TextColumn("低點拉抬"),
-            "高點回落": st.column_config.TextColumn("高點回落"),
-            "昨收日期": st.column_config.TextColumn("昨收日期"),
-            "昨收來源": st.column_config.TextColumn("昨收來源"),
-        },
-    )
-
-
-# =============================================================================
-# 每日訊號 Log 檢視 / 下載
-# =============================================================================
-with st.sidebar.expander("📝 今日訊號 Log", expanded=False):
-    today_log_text, today_log_path = read_signal_log()
-    log_line_count = len([ln for ln in today_log_text.splitlines() if ln.strip()])
-
-    st.caption(f"檔案：{today_log_path}｜目前已記錄 {log_line_count} 筆")
-
-    if st.session_state.get("signal_log_write_error"):
-        st.error(f"寫入 log 曾發生錯誤：{st.session_state['signal_log_write_error']}")
-
-    if today_log_text:
-        st.text_area(
-            "今日訊號紀錄（最新在最下面）",
-            value=today_log_text,
-            height=260,
-        )
-        st.download_button(
-            "⬇️ 下載今日 log.txt",
-            data=today_log_text.encode("utf-8"),
-            file_name=os.path.basename(today_log_path),
-            mime="text/plain",
-        )
-    else:
-        st.caption("今天尚無訊號紀錄")
-
-
-with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
-    debug_code = st.text_input("輸入代碼看最後 WS 原始訊息", value="2330")
-    msg = manager.get_message(debug_code)
-
-    if msg:
-        st.caption(f"時間：{msg['time'].strftime('%Y-%m-%d %H:%M:%S')}")
-        st.json(msg["raw"])
-
-        debug_signal = manager.get_entry_signal(
-            debug_code,
-            bucket_sec=st.session_state.entry_bucket_sec,
-            track_sec=st.session_state.entry_track_sec,
-            volume_ratio_threshold=st.session_state.entry_volume_ratio,
-            price_move_pct=st.session_state.entry_price_move_pct,
-            early_5s_pct=st.session_state.entry_early_5s_pct,
-            early_10s_pct=st.session_state.entry_early_10s_pct,
-            buy_pressure_ratio_threshold=st.session_state.entry_buy_pressure_ratio,
-            cooldown_sec=st.session_state.entry_cooldown_sec,
-            min_current_volume=st.session_state.entry_min_current_volume,
-            early_2s_pct=st.session_state.entry_early_2s_pct,
-            tick_jump_pct=st.session_state.entry_tick_jump_pct,
-            min_ticks_in_bucket=st.session_state.entry_min_ticks_in_bucket,
-        )
-
-        st.markdown("### 訊號 Debug")
-        st.json({
-            "訊號": debug_signal.get("text"),
-            "訊號等級": debug_signal.get("signal_level"),
-            "本段量": debug_signal.get("current_volume"),
-            "本段筆數": debug_signal.get("ticks_in_bucket"),
-            "前段量": debug_signal.get("previous_volume"),
-            "預估本段量": debug_signal.get("projected_bucket_volume"),
-            "量比": debug_signal.get("volume_ratio"),
-            "外盤占比": debug_signal.get("buy_pressure_ratio"),
-            "單筆跳動": debug_signal.get("last_tick_jump_pct"),
-            "2秒漲幅": debug_signal.get("price_change_2s"),
-            "5秒漲幅": debug_signal.get("price_change_5s"),
-            "10秒漲幅": debug_signal.get("price_change_10s"),
-            "30秒漲幅": debug_signal.get("price_change_30s"),
-            "60秒低點": debug_signal.get("low_track"),
-            "60秒高點": debug_signal.get("high_track"),
-            "低點拉抬": debug_signal.get("rise_from_low_pct"),
-            "突破高點": debug_signal.get("near_high_breakout"),
-            "volume_ok": debug_signal.get("volume_ok"),
-            "buy_pressure_ok": debug_signal.get("buy_pressure_ok"),
-            "short_momentum_ok": debug_signal.get("short_momentum_ok"),
-            "position_ok": debug_signal.get("position_ok"),
-            "flash": debug_signal.get("flash"),
-        })
-
-    else:
-        st.caption("尚未收到此代碼的 WebSocket 訊息")
-
-
-# =============================================================================
-# 自動刷新
-# =============================================================================
-if (
-    st.session_state.auto_refresh_enabled
-    and not st.session_state.group_editor_unlocked
-    and not st.session_state.editing_mode
-):
-    time.sleep(int(st.session_state.refresh_sec))
-    st.rerun()
+            "預估本段
