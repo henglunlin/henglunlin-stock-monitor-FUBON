@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-盤中即時成交監控 - 純富邦 WebSocket 版
+盤中即時成交監控 - 純富邦 WebSocket 版 (含 Telegram 推送)
 
 目標：
 捕捉股價瞬間拉抬時的進場訊號。
@@ -14,7 +14,7 @@
 6. 使用最近 60 秒高低點追蹤，判斷突破高點或從低點急拉。
 7. 分成「預警」與「進場訊號」。
 8. 修正儀表板 HTML anchor UI 問題。
-                                                                      
+9. 整合 Telegram 推播開關與 st.secrets 預設值讀取功能。
 """
 
 import os
@@ -25,13 +25,13 @@ import time
 import base64
 import tempfile
 import threading
-               
+import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-                                                             
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 try:
     from fubon_neo.sdk import FubonSDK
@@ -74,14 +74,9 @@ DEFAULT_BUY_PRESSURE_RATIO = 0.55
 DEFAULT_SIGNAL_COOLDOWN_SEC = 45
 DEFAULT_MIN_CURRENT_VOLUME = 20
 
-# --- 急漲即時偵測新增參數 ---
-# 2 秒極短窗口漲幅門檻（用來抓最快速的瞬間拉抬，比 5 秒窗更靈敏）
 DEFAULT_EARLY_2S_PCT = 0.5
-# 單筆跳動門檻：最新一筆成交價相較「前一筆成交價」的漲幅，抓單筆巨量瞬間跳價
 DEFAULT_TICK_JUMP_PCT = 0.5
-# 量能視窗內至少要有幾筆成交，避免單一大單假突破
 DEFAULT_MIN_TICKS_IN_BUCKET = 2
-# 量能視窗投影時，經過秒數的下限，避免視窗剛開始 1~2 秒就被單筆巨量放大成離譜倍數
 BUCKET_ELAPSED_FLOOR_SEC = 3.0
 
 DEFAULT_STOCK_GROUPS = {
@@ -95,21 +90,21 @@ DEFAULT_STOCK_GROUPS = {
     ],
 }
 
-                                                                               
-                           
-                                                                               
-                                                              
-        
-                             
-                                  
-                                                                      
-                                              
-                     
-            
-                                       
+# =============================================================================
+# Secrets & Telegram 設定
+# =============================================================================
+def get_secret_or_default(key: str, default: str = "") -> str:
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+        if "telegram" in st.secrets and key in st.secrets["telegram"]:
+            return st.secrets["telegram"][key]
+    except Exception:
+        pass
+    return os.environ.get(key, default)
 
-                                                                    
-                                                                
+TELEGRAM_BOT_TOKEN = get_secret_or_default("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = get_secret_or_default("TELEGRAM_CHAT_ID", "")
 
 # =============================================================================
 # CSS
@@ -1088,16 +1083,6 @@ class FubonRealtimeManager:
         return total
 
     def _price_at_or_before(self, price_points, target_ts):
-        """
-        取得「在 target_ts 當下」真正有效的成交價，也就是時間 <= target_ts
-        的最後一筆成交。這是計算「N 秒前價格」正確的做法：
-        如果某檔股票冷清一陣子（例如 8 秒沒成交），然後突然爆量急拉，
-        用「>= target_ts 的第一筆」當基準會抓到剛好是急拉的那一筆本身，
-        導致漲幅算出來是 0%，完全抓不到訊號。
-        改用「<= target_ts 的最後一筆」，急拉前最後成交價才是正確基準。
-        若真的完全沒有更早的資料（剛開始監控），則退而求其次用
-        目前手上最早的一筆價格做近似基準，避免直接回傳 None 而漏掉訊號。
-        """
         before = None
         earliest = None
 
@@ -1138,11 +1123,6 @@ class FubonRealtimeManager:
         return (float(current_price) / float(base_price) - 1) * 100
 
     def _last_tick_jump_pct(self, recent_ticks, current_price):
-        """
-        單筆跳動幅度：目前成交價 相對於「上一筆成交價」的漲幅。
-        用來抓最極端的狀況——一筆大單直接把價格瞬間打上去，
-        連 2 秒窗口都還沒等到就該提示的情況。
-        """
         if current_price is None:
             return None
 
@@ -1255,10 +1235,6 @@ class FubonRealtimeManager:
         bucket_start_ts = int(now_ts // bucket_sec) * bucket_sec
         previous_bucket_start_ts = bucket_start_ts - bucket_sec
 
-        # 視窗剛開始的 1~2 秒，分母太小會讓「預估量」被單一大單放大成離譜倍數
-        # （例如視窗才過 1 秒就來一張大單，除以 1 秒再乘 30 秒 = 30 倍量），
-        # 因此用 BUCKET_ELAPSED_FLOOR_SEC 當作分母下限，避免早期雜訊誤觸發，
-        # 同時仍保留「不用等滿一個視窗才反應」的即時性。
         elapsed_in_bucket = max(BUCKET_ELAPSED_FLOOR_SEC, now_ts - bucket_start_ts)
 
         current_volume = self._sum_tick_volume(
@@ -1300,9 +1276,6 @@ class FubonRealtimeManager:
                 and enough_ticks
             )
         elif current_volume >= min_current_volume and enough_ticks:
-            # 前一個視窗完全沒有成交（前段量=0），代表這檔股票原本很冷清。
-            # 這種「從 0 突然噴量」正是最典型的急拉起漲點，不能因為
-            # 分母是 0 算不出量比就放棄判斷，改用「本段量已達最低門檻」直接視為量能達標。
             volume_ok = True
 
         buy_pressure_ratio = None
@@ -1404,10 +1377,6 @@ class FubonRealtimeManager:
             and cooldown_ok
         )
 
-        # 🔥 極早期訊號（flash）：完全不等視窗量比、也不等 60 秒高低點確認，
-        # 只要「最新一筆是外盤買」且「單筆跳動」或「2 秒漲幅」已經達標，
-        # 就先跳出來提醒。這是三層裡反應最快的一層，代價是雜訊也最多，
-        # 只在還沒達到 warning / entry 時才顯示，避免蓋掉更有把握的訊號。
         flash_active = (
             not entry_active
             and not warning_active
@@ -1554,93 +1523,83 @@ def save_backup_snapshot(groups):
     return file_path
 
 
-                                                                               
-                       
-                                                                               
-                                     
-                                                      
-              
-                                                                         
-               
-                                    
-                     
-                             
-                                         
-     
-        
-                                                         
-                                  
-                                                                        
-                          
-                                               
+# =============================================================================
+# Telegram 推送功能
+# =============================================================================
+def send_telegram_message(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code != 200:
+            st.error(f"Telegram 傳送失敗，API 回傳：{res.text}")
+    except Exception as e:
+        st.error(f"Telegram 連線失敗: {e}")
 
-                                                                           
-                              
-                                            
-              
+def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
+    # 檢查開關是否開啟
+    if not st.session_state.tg_push_enabled:
+        return
 
-                  
-              
+    if not signal:
+        return
 
-                                              
+    level = signal.get("signal_level", "none")
     
-                                         
-              
+    if level not in ("warning", "entry"):
+        return
 
-                                         
-                      
-              
+    signal_key = signal.get("signal_key")
+    if not signal_key:
+        return
 
-                                                       
-                                 
-              
+    pushed_keys = st.session_state.telegram_pushed_keys
+    if signal_key in pushed_keys:
+        return
 
-                               
-                               
-                                                                              
+    pushed_keys.add(signal_key)
+    if len(pushed_keys) > 2000:
+        st.session_state.telegram_pushed_keys = set(list(pushed_keys)[-1000:])
 
-                                    
-                                                                                                    
-                                                                
-                                           
+    signal_time = signal.get("time")
+    time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
+    price_text = format_price_value(signal.get("current_price"))
+    pct_text = format_pct_value(change_pct)
 
-                                                                                           
+    prefix = "🚀 <b>[進場訊號]</b>" if level == "entry" else "⚠️ <b>[預警]</b>"
 
-           
-                     
-                                                      
-                                                        
-                                 
-                               
-                                   
-     
+    msg = (
+        f"{prefix}\n"
+        f"<b>{group_name}｜{code} {stock_name}</b>\n"
+        f"現價：{price_text}｜漲幅：{pct_text}\n"
+        f"時間：{time_text}\n"
+        f"------------------\n"
+        f"{signal.get('text', '')}"
+    )
 
-                                                                                                            
-                                                                   
-                         
-             
+    # 利用 Thread 傳送避免阻塞介面，並且注入 context 讓 st.error 可以在背景正常運作
+    t = threading.Thread(target=send_telegram_message, args=(msg,))
+    add_script_run_ctx(t)
+    t.start()
 
 
 # =============================================================================
 # 每日訊號 Log
 # =============================================================================
 def get_signal_log_path(for_date=None):
-    """
-    每天一個檔案，檔名帶日期，例如 signal_logs/log_20260708.txt。
-    這樣「今天的 log.txt」不會被昨天的紀錄洗掉，也方便之後回顧某一天的訊號。
-    """
     day = for_date or datetime.now(TW_TZ)
     os.makedirs(SIGNAL_LOG_DIR, exist_ok=True)
     return os.path.join(SIGNAL_LOG_DIR, f"log_{day.strftime('%Y%m%d')}.txt")
 
 
 def append_signal_log(group_name, code, stock_name, signal, change_pct):
-    """
-    把一筆訊號（🔥極早期 / ⚠️預警 / 🚀進場）寫進當天的 log 檔。
-    用 signal_key 搭配 session_state 做去重，避免同一個訊號在自動刷新
-    期間被重複寫入同一行好幾次；不同 session（例如重開瀏覽器分頁）
-    仍會各自記一次，但這對「當天完整留存訊號紀錄」的目的影響不大。
-    """
     if not signal:
         return
 
@@ -1682,7 +1641,6 @@ def append_signal_log(group_name, code, stock_name, signal, change_pct):
                 f.write(line + "\n")
 
     except Exception as e:
-        # log 寫入失敗不該讓整個監控頁面掛掉，記到 session_state 讓 UI 可以提示錯誤即可
         st.session_state["signal_log_write_error"] = str(e)
 
 
@@ -1699,15 +1657,15 @@ def read_signal_log(for_date=None):
         return f"讀取 log 失敗：{e}", log_path
 
 
-
+# Session State 初始化
 if "auto_refresh_enabled" not in st.session_state:
     st.session_state.auto_refresh_enabled = True
 
 if "refresh_sec" not in st.session_state:
     st.session_state.refresh_sec = 3
 
-                                             
-                                            
+if "tg_push_enabled" not in st.session_state:
+    st.session_state.tg_push_enabled = False
 
 if "entry_bucket_sec" not in st.session_state:
     st.session_state.entry_bucket_sec = DEFAULT_ENTRY_BUCKET_SEC
@@ -1780,8 +1738,8 @@ if "entry_signal_toast_keys" not in st.session_state:
 if "_entry_signal_toast_messages" not in st.session_state:
     st.session_state._entry_signal_toast_messages = []
 
-                                                  
-                                                 
+if "telegram_pushed_keys" not in st.session_state:
+    st.session_state.telegram_pushed_keys = set()
 
 
 def show_pending_toasts():
@@ -2202,12 +2160,12 @@ with control_cols[1]:
     st.toggle("⏱️ 自動刷新", key="auto_refresh_enabled")
 
 with control_cols[2]:
-                                                                                                                                                   
-                                                   
-                                                  
-                  
+    tg_push = st.toggle("📲 Telegram 推播", value=st.session_state.tg_push_enabled, help="必須開啟此選項，機器人才會發送推播")
+    if tg_push != st.session_state.tg_push_enabled:
+        st.session_state.tg_push_enabled = tg_push
+        st.rerun()
 
-                     
+with control_cols[3]:
     st.number_input(
         "刷新秒數",
         min_value=1,
@@ -2216,7 +2174,7 @@ with control_cols[2]:
         key="refresh_sec",
     )
 
-with control_cols[3]:
+with control_cols[4]:
     pct_threshold = st.number_input(
         "漲幅門檻%",
         min_value=0.0,
@@ -2225,7 +2183,7 @@ with control_cols[3]:
         step=0.5,
     )
 
-with control_cols[4]:
+with control_cols[5]:
     st.number_input(
         "量能視窗秒",
         min_value=5,
@@ -2234,7 +2192,7 @@ with control_cols[4]:
         key="entry_bucket_sec",
     )
 
-with control_cols[5]:
+with control_cols[6]:
     st.number_input(
         "高低點追蹤秒",
         min_value=10,
@@ -2243,7 +2201,7 @@ with control_cols[5]:
         key="entry_track_sec",
     )
 
-with control_cols[6]:
+with control_cols[7]:
     st.number_input(
         "量比門檻",
         min_value=0.1,
@@ -2252,7 +2210,7 @@ with control_cols[6]:
         key="entry_volume_ratio",
     )
 
-with control_cols[7]:
+with control_cols[8]:
     st.number_input(
         "價格變動%",
         min_value=0.1,
@@ -2261,7 +2219,7 @@ with control_cols[7]:
         key="entry_price_move_pct",
     )
 
-with control_cols[8]:
+with control_cols[9]:
     st.number_input(
         "外盤占比",
         min_value=0.0,
@@ -2271,7 +2229,7 @@ with control_cols[8]:
         help="0.55 = 外盤占比 55%",
     )
 
-with control_cols[9]:
+with control_cols[10]:
     st.number_input(
         "最低本段量",
         min_value=0,
@@ -2280,7 +2238,7 @@ with control_cols[9]:
         key="entry_min_current_volume",
     )
 
-with control_cols[10]:
+with control_cols[11]:
     st.number_input(
         "冷卻秒數",
         min_value=0,
@@ -2289,7 +2247,7 @@ with control_cols[10]:
         key="entry_cooldown_sec",
     )
 
-with control_cols[11]:
+with control_cols[12]:
     st.number_input(
         "2秒預警%",
         min_value=0.1,
@@ -2299,7 +2257,7 @@ with control_cols[11]:
         help="極短窗口漲幅門檻，比5秒窗更快抓到瞬間拉抬",
     )
 
-with control_cols[12]:
+with control_cols[13]:
     st.number_input(
         "單筆跳動%",
         min_value=0.1,
@@ -2309,17 +2267,17 @@ with control_cols[12]:
         help="最新一筆成交價相較上一筆的漲幅，抓單筆巨量瞬間跳價（🔥極早期訊號用）",
     )
 
-with control_cols[13]:
-                                                          
-                          
-    st.number_input(
-        "視窗最少筆數",
-        min_value=1,
-        max_value=20,
-        step=1,
-        key="entry_min_ticks_in_bucket",
-        help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發",
-    )
+# 把最後一欄收納到 sidebar 或以其餘空間處理，因為加了推播開關推移了一格，
+# 不過 Streamlit 預設會自動流動控制列寬度。
+st.sidebar.markdown("---")
+st.sidebar.number_input(
+    "視窗最少筆數",
+    min_value=1,
+    max_value=20,
+    step=1,
+    key="entry_min_ticks_in_bucket",
+    help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發",
+)
 
 
 render_fubon_login()
@@ -2371,7 +2329,7 @@ st.info(
     "🔥 極早期訊號：最新一筆是外盤買，且單筆跳動或2秒漲幅已達標，最快、雜訊也最多，僅供提早注意。\n"
     "⚠️ 預警：量能達標＋外盤占比達標＋2/5/10秒任一短線漲幅達標。\n"
     "🚀 進場訊號：預警條件全部成立，再加上30秒漲幅或60秒突破高點/低點急拉確認，並通過冷卻時間。\n"
-    "（已修正：前段量為0時的爆量偵測、5/10/30秒漲幅的基準價計算bug、視窗剛開始時預估量被單筆大單誤放大的問題）"
+    "🔔 Telegram 推送：只推送「預警」與「進場訊號」至綁定的群組。"
 )
 
 st.caption(
@@ -2502,8 +2460,8 @@ for group_name, stocks in st.session_state.stock_groups.items():
             queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct)
             append_signal_log(group_name, code, stock_name, signal, change_pct)
             
-                                            
-                                                                                  
+            # --- 觸發 Telegram 推送 ---
+            push_telegram_signal(group_name, code, stock_name, signal, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
