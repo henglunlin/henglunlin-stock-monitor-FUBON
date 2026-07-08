@@ -79,6 +79,18 @@ DEFAULT_TICK_JUMP_PCT = 0.5
 DEFAULT_MIN_TICKS_IN_BUCKET = 2
 BUCKET_ELAPSED_FLOOR_SEC = 3.0
 
+# --- 今日最低點反彈偵測 ---
+# 從開盤持續追蹤當天最低成交價，現價相較今日最低點反彈達此門檻即觸發提醒
+DEFAULT_DAY_LOW_REBOUND_PCT = 2.0
+# 同一檔股票的低點反彈提醒冷卻秒數，避免在低點附近來回震盪時洗版
+DEFAULT_DAY_LOW_REBOUND_COOLDOWN_SEC = 60
+
+# --- 中期動能偵測（預設：3分鐘內上漲1.5%）---
+# 和 5秒/10秒/30秒的瞬間拉抬判斷不同，這是抓「一段時間內持續緩步走高」的走勢
+DEFAULT_MOMENTUM_WINDOW_SEC = 180
+DEFAULT_MOMENTUM_WINDOW_PCT = 1.5
+DEFAULT_MOMENTUM_COOLDOWN_SEC = 60
+
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
         "2330.TW", "00981A.TW", "2449.TW", "2317.TW", "3711.TW",
@@ -173,6 +185,18 @@ st.markdown(
         border-color:#ffa940;
         background:#fff7e6;
         box-shadow:0 1px 8px rgba(250,140,22,.18);
+    }
+
+    .dash-card.daylow {
+        border-color:#36cfc9;
+        background:#e6fffb;
+        box-shadow:0 1px 8px rgba(19,194,194,.18);
+    }
+
+    .dash-card.momentum {
+        border-color:#9254de;
+        background:#f9f0ff;
+        box-shadow:0 1px 8px rgba(114,46,209,.18);
     }
 
     .dash-title {
@@ -330,6 +354,23 @@ def format_percent_ratio(value):
         return f"{float(value) * 100:.0f}%"
     except Exception:
         return "-"
+
+
+def format_seconds_as_label(total_seconds):
+    """
+    把秒數轉成好讀的標籤：60的整數倍顯示「N分鐘」，否則顯示「N秒」。
+    用在「60秒高低點」這類欄位名稱上，讓標籤跟著使用者調整的秒數走，
+    而不是永遠寫死顯示 60。
+    """
+    try:
+        total_seconds = int(total_seconds)
+    except Exception:
+        return "-"
+
+    if total_seconds > 0 and total_seconds % 60 == 0:
+        return f"{total_seconds // 60}分鐘"
+
+    return f"{total_seconds}秒"
 
 
 def pct_class(value):
@@ -919,11 +960,20 @@ class FubonRealtimeManager:
             "total_sell_vol": 0,
             "recent_ticks": [],
             "price_points": [],
+            "day_low": None,
+            "day_low_date": None,
+            "day_low_at": None,
             "entry_state": {
                 "armed": False,
                 "armed_at": None,
                 "armed_low": None,
                 "armed_high": None,
+                "last_signal_at": None,
+            },
+            "day_low_rebound_state": {
+                "last_signal_at": None,
+            },
+            "momentum_state": {
                 "last_signal_at": None,
             },
         }
@@ -954,6 +1004,12 @@ class FubonRealtimeManager:
             if "entry_state" not in status:
                 status["entry_state"] = self._default_status()["entry_state"]
 
+            if "day_low_rebound_state" not in status:
+                status["day_low_rebound_state"] = self._default_status()["day_low_rebound_state"]
+
+            if "momentum_state" not in status:
+                status["momentum_state"] = self._default_status()["momentum_state"]
+
             if price is not None:
                 status["last_ws_price"] = price
 
@@ -966,8 +1022,23 @@ class FubonRealtimeManager:
                 status["price_points"] = [
                     p for p in price_points
                     if hasattr(p.get("time"), "timestamp")
-                    and (now - p.get("time")).total_seconds() <= 300
+                    and (now - p.get("time")).total_seconds() <= 400
                 ][-1500:]
+
+                # 持續追蹤「今日」最低成交價。用日期字串判斷是否跨日，
+                # 跨日（或第一次收到這檔的報價）就重新從目前這筆價格開始記錄，
+                # 同一天內則只要出現更低的價格就更新。
+                today_str = now.strftime("%Y%m%d")
+                existing_day_low = status.get("day_low")
+                existing_day_low_date = status.get("day_low_date")
+
+                if existing_day_low is None or existing_day_low_date != today_str:
+                    status["day_low"] = float(price)
+                    status["day_low_date"] = today_str
+                    status["day_low_at"] = now
+                elif float(price) < float(existing_day_low):
+                    status["day_low"] = float(price)
+                    status["day_low_at"] = now
 
             tick_volume = None
 
@@ -1475,6 +1546,170 @@ class FubonRealtimeManager:
             "track_sec": track_sec,
         }
 
+    def get_day_low_rebound_signal(
+        self,
+        symbol: str,
+        rebound_pct_threshold: float = DEFAULT_DAY_LOW_REBOUND_PCT,
+        cooldown_sec: int = DEFAULT_DAY_LOW_REBOUND_COOLDOWN_SEC,
+    ):
+        """
+        獨立於量能/外盤占比之外的判斷標準之一：
+        不斷記錄「今日」最低成交價，現價相較今日最低點的反彈幅度
+        一旦達到門檻，就觸發提醒。條件單純只看價格，不要求量能或外盤占比，
+        用來捕捉「盤中破底後止穩反彈」這種和瞬間拉抬不同類型的機會。
+        """
+        code = symbol_to_code(symbol)
+        now = datetime.now(TW_TZ)
+
+        try:
+            rebound_pct_threshold = max(0.1, float(rebound_pct_threshold))
+        except Exception:
+            rebound_pct_threshold = DEFAULT_DAY_LOW_REBOUND_PCT
+
+        try:
+            cooldown_sec = max(0, int(cooldown_sec))
+        except Exception:
+            cooldown_sec = DEFAULT_DAY_LOW_REBOUND_COOLDOWN_SEC
+
+        with self.lock:
+            status = copy.deepcopy(self.tick_status.get(code, self._default_status()))
+
+        current_price = status.get("last_ws_price")
+        day_low = status.get("day_low")
+        day_low_at = status.get("day_low_at")
+        rebound_state = status.get("day_low_rebound_state") or {"last_signal_at": None}
+        last_signal_at = rebound_state.get("last_signal_at")
+
+        rebound_pct = None
+        cooldown_ok = True
+
+        if hasattr(last_signal_at, "timestamp"):
+            cooldown_ok = (now - last_signal_at).total_seconds() >= cooldown_sec
+
+        active = False
+
+        if current_price is not None and day_low is not None and day_low > 0:
+            rebound_pct = (float(current_price) / float(day_low) - 1) * 100
+            active = rebound_pct >= rebound_pct_threshold and cooldown_ok
+
+        if active:
+            rebound_state["last_signal_at"] = now
+
+            with self.lock:
+                self.tick_status.setdefault(code, self._default_status())["day_low_rebound_state"] = rebound_state
+
+        if active:
+            text = (
+                f"📈 今日低點反彈｜"
+                f"今日最低 {format_price_value(day_low)} → 現價 {format_price_value(current_price)}｜"
+                f"反彈 {format_signed_pct(rebound_pct)}（門檻 {rebound_pct_threshold:.1f}%）"
+            )
+            signal_level = "day_low_rebound"
+        else:
+            text = "尚未觸發"
+            signal_level = "none"
+
+        signal_key = f"{code}_daylow_{int(now.timestamp() // 10)}_p{current_price}"
+
+        return {
+            "active": bool(active),
+            "signal_level": signal_level,
+            "text": text,
+            "time": now,
+            "signal_key": signal_key,
+            "current_price": current_price,
+            "day_low": day_low,
+            "day_low_at": day_low_at,
+            "rebound_pct": rebound_pct,
+            "rebound_pct_threshold": rebound_pct_threshold,
+        }
+
+    def get_window_momentum_signal(
+        self,
+        symbol: str,
+        window_sec: int = DEFAULT_MOMENTUM_WINDOW_SEC,
+        pct_threshold: float = DEFAULT_MOMENTUM_WINDOW_PCT,
+        cooldown_sec: int = DEFAULT_MOMENTUM_COOLDOWN_SEC,
+    ):
+        """
+        獨立於量能/外盤占比之外的判斷標準之二：
+        固定觀察一段較長的時間窗口（預設3分鐘＝180秒），只要現價相較窗口
+        起點的漲幅達到門檻，就觸發提醒。跟 5秒/10秒 的瞬間拉抬判斷不同，
+        這個是用來抓「沒有單筆爆量、但股價持續緩步走高」的中期動能走勢。
+        """
+        code = symbol_to_code(symbol)
+        now = datetime.now(TW_TZ)
+
+        try:
+            window_sec = max(10, int(window_sec))
+        except Exception:
+            window_sec = DEFAULT_MOMENTUM_WINDOW_SEC
+
+        try:
+            pct_threshold = max(0.1, float(pct_threshold))
+        except Exception:
+            pct_threshold = DEFAULT_MOMENTUM_WINDOW_PCT
+
+        try:
+            cooldown_sec = max(0, int(cooldown_sec))
+        except Exception:
+            cooldown_sec = DEFAULT_MOMENTUM_COOLDOWN_SEC
+
+        with self.lock:
+            status = copy.deepcopy(self.tick_status.get(code, self._default_status()))
+
+        current_price = status.get("last_ws_price")
+        price_points = status.get("price_points", [])
+        momentum_state = status.get("momentum_state") or {"last_signal_at": None}
+        last_signal_at = momentum_state.get("last_signal_at")
+
+        window_change_pct = self._price_change_from_seconds(price_points, current_price, window_sec)
+
+        cooldown_ok = True
+
+        if hasattr(last_signal_at, "timestamp"):
+            cooldown_ok = (now - last_signal_at).total_seconds() >= cooldown_sec
+
+        active = (
+            window_change_pct is not None
+            and window_change_pct >= pct_threshold
+            and cooldown_ok
+        )
+
+        if active:
+            momentum_state["last_signal_at"] = now
+
+            with self.lock:
+                self.tick_status.setdefault(code, self._default_status())["momentum_state"] = momentum_state
+
+        window_label = format_seconds_as_label(window_sec)
+
+        if active:
+            text = (
+                f"📊 {window_label}內上漲｜"
+                f"{window_label}漲幅 {format_signed_pct(window_change_pct)}（門檻 {pct_threshold:.1f}%）｜"
+                f"現價 {format_price_value(current_price)}"
+            )
+            signal_level = "momentum_window"
+        else:
+            text = "尚未觸發"
+            signal_level = "none"
+
+        signal_key = f"{code}_momentum{window_sec}_{int(now.timestamp() // 10)}_p{current_price}"
+
+        return {
+            "active": bool(active),
+            "signal_level": signal_level,
+            "text": text,
+            "time": now,
+            "signal_key": signal_key,
+            "current_price": current_price,
+            "window_sec": window_sec,
+            "window_label": window_label,
+            "window_change_pct": window_change_pct,
+            "pct_threshold": pct_threshold,
+        }
+
     def get_status(self):
         with self.lock:
             return {
@@ -1553,7 +1788,7 @@ def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
 
     level = signal.get("signal_level", "none")
     
-    if level not in ("warning", "entry"):
+    if level not in ("warning", "entry", "day_low_rebound", "momentum_window"):
         return
 
     signal_key = signal.get("signal_key")
@@ -1573,7 +1808,13 @@ def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
     price_text = format_price_value(signal.get("current_price"))
     pct_text = format_pct_value(change_pct)
 
-    prefix = "🚀 <b>[進場訊號]</b>" if level == "entry" else "⚠️ <b>[預警]</b>"
+    prefix_map = {
+        "entry": "🚀 <b>[進場訊號]</b>",
+        "warning": "⚠️ <b>[預警]</b>",
+        "day_low_rebound": "📈 <b>[今日低點反彈]</b>",
+        "momentum_window": "📊 <b>[區間動能]</b>",
+    }
+    prefix = prefix_map.get(level, "⚠️ <b>[預警]</b>")
 
     msg = (
         f"{prefix}\n"
@@ -1605,7 +1846,7 @@ def append_signal_log(group_name, code, stock_name, signal, change_pct):
 
     level = signal.get("signal_level", "none")
 
-    if level not in ("flash", "warning", "entry"):
+    if level not in ("flash", "warning", "entry", "day_low_rebound", "momentum_window"):
         return
 
     signal_key = signal.get("signal_key")
@@ -1624,7 +1865,13 @@ def append_signal_log(group_name, code, stock_name, signal, change_pct):
     signal_time = signal.get("time") or datetime.now(TW_TZ)
     time_text = signal_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(signal_time, "strftime") else "-"
 
-    level_label = {"flash": "極早期", "warning": "預警", "entry": "進場"}.get(level, level)
+    level_label = {
+        "flash": "極早期",
+        "warning": "預警",
+        "entry": "進場",
+        "day_low_rebound": "低點反彈",
+        "momentum_window": "區間動能",
+    }.get(level, level)
     price_text = format_price_value(signal.get("current_price"))
     pct_text = format_pct_value(change_pct)
 
@@ -1703,6 +1950,21 @@ if "entry_tick_jump_pct" not in st.session_state:
 if "entry_min_ticks_in_bucket" not in st.session_state:
     st.session_state.entry_min_ticks_in_bucket = DEFAULT_MIN_TICKS_IN_BUCKET
 
+if "day_low_rebound_pct" not in st.session_state:
+    st.session_state.day_low_rebound_pct = DEFAULT_DAY_LOW_REBOUND_PCT
+
+if "day_low_rebound_cooldown_sec" not in st.session_state:
+    st.session_state.day_low_rebound_cooldown_sec = DEFAULT_DAY_LOW_REBOUND_COOLDOWN_SEC
+
+if "momentum_window_sec" not in st.session_state:
+    st.session_state.momentum_window_sec = DEFAULT_MOMENTUM_WINDOW_SEC
+
+if "momentum_window_pct" not in st.session_state:
+    st.session_state.momentum_window_pct = DEFAULT_MOMENTUM_WINDOW_PCT
+
+if "momentum_cooldown_sec" not in st.session_state:
+    st.session_state.momentum_cooldown_sec = DEFAULT_MOMENTUM_COOLDOWN_SEC
+
 if "stock_groups" not in st.session_state:
     st.session_state.stock_groups = load_stock_groups()
 
@@ -1775,7 +2037,13 @@ def queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct):
     current_price = signal.get("current_price")
     price_text = format_price_value(current_price)
 
-    prefix = "🚀 進場訊號" if signal.get("active") else "⚠️ 預警"
+    prefix_map = {
+        "entry": "🚀 進場訊號",
+        "warning": "⚠️ 預警",
+        "day_low_rebound": "📈 今日低點反彈",
+        "momentum_window": "📊 區間動能",
+    }
+    prefix = prefix_map.get(signal.get("signal_level"), "⚠️ 預警")
 
     msg = (
         f"{prefix}\n"
@@ -2279,6 +2547,54 @@ st.sidebar.number_input(
     help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發",
 )
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("**📈 今日低點反彈提醒**")
+st.sidebar.caption("不斷記錄今日最低成交價，現價相較最低點反彈達門檻即提醒，純看價格、不看量能")
+st.sidebar.number_input(
+    "低點反彈%",
+    min_value=0.1,
+    max_value=20.0,
+    step=0.5,
+    key="day_low_rebound_pct",
+    help="現價相較今日最低點反彈達此幅度即觸發📈提醒",
+)
+st.sidebar.number_input(
+    "反彈冷卻秒數",
+    min_value=0,
+    max_value=600,
+    step=10,
+    key="day_low_rebound_cooldown_sec",
+    help="同一檔股票的低點反彈提醒最短間隔，避免在低點附近來回震盪時洗版",
+)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**📊 區間動能提醒（預設3分鐘漲1.5%）**")
+st.sidebar.caption("固定觀察一段時間窗口的漲幅，抓沒有單筆爆量、但持續緩步走高的走勢")
+st.sidebar.number_input(
+    "動能視窗秒數",
+    min_value=30,
+    max_value=400,
+    step=30,
+    key="momentum_window_sec",
+    help="預設180秒＝3分鐘，可依需求調整觀察窗口長度",
+)
+st.sidebar.number_input(
+    "動能漲幅門檻%",
+    min_value=0.1,
+    max_value=20.0,
+    step=0.1,
+    key="momentum_window_pct",
+    help="視窗內漲幅達此門檻即觸發📊提醒",
+)
+st.sidebar.number_input(
+    "動能冷卻秒數",
+    min_value=0,
+    max_value=600,
+    step=10,
+    key="momentum_cooldown_sec",
+    help="同一檔股票的區間動能提醒最短間隔",
+)
+
 
 render_fubon_login()
 render_group_editor_lock()
@@ -2325,11 +2641,14 @@ if status["error"]:
     st.error(status["error"])
 
 st.info(
-    "訊號邏輯（三層）：\n"
+    "訊號邏輯（四種判斷標準，彼此獨立，可同時出現）：\n"
     "🔥 極早期訊號：最新一筆是外盤買，且單筆跳動或2秒漲幅已達標，最快、雜訊也最多，僅供提早注意。\n"
     "⚠️ 預警：量能達標＋外盤占比達標＋2/5/10秒任一短線漲幅達標。\n"
-    "🚀 進場訊號：預警條件全部成立，再加上30秒漲幅或60秒突破高點/低點急拉確認，並通過冷卻時間。\n"
-    "🔔 Telegram 推送：只推送「預警」與「進場訊號」至綁定的群組。"
+    f"🚀 進場訊號：預警條件全部成立，再加上{int(st.session_state.entry_bucket_sec)}秒漲幅或"
+    f"{int(st.session_state.entry_track_sec)}秒突破高點/低點急拉確認，並通過冷卻時間。\n"
+    "📈 今日低點反彈：不斷記錄當天最低成交價，現價相較今日最低點反彈達門檻即觸發，純看價格、不看量能，用來抓破底後止穩反彈。\n"
+    "📊 區間動能：固定觀察一段時間窗口（預設3分鐘）的漲幅，抓沒有單筆爆量、但持續緩步走高的走勢。\n"
+    "🔔 Telegram 推送：推送「預警」「進場訊號」「今日低點反彈」「區間動能」四種提醒至綁定的群組。"
 )
 
 st.caption(
@@ -2344,7 +2663,10 @@ st.caption(
     f"高低點追蹤 {int(st.session_state.entry_track_sec)} 秒｜"
     f"最低本段量 {int(st.session_state.entry_min_current_volume)} 張｜"
     f"視窗最少筆數 {int(st.session_state.entry_min_ticks_in_bucket)} 筆｜"
-    f"冷卻 {int(st.session_state.entry_cooldown_sec)} 秒"
+    f"冷卻 {int(st.session_state.entry_cooldown_sec)} 秒｜"
+    f"今日低點反彈 ≥ {float(st.session_state.day_low_rebound_pct):.1f}%（冷卻 {int(st.session_state.day_low_rebound_cooldown_sec)} 秒）｜"
+    f"區間動能 {format_seconds_as_label(st.session_state.momentum_window_sec)}內 ≥ "
+    f"{float(st.session_state.momentum_window_pct):.1f}%（冷卻 {int(st.session_state.momentum_cooldown_sec)} 秒）"
 )
 
 
@@ -2362,6 +2684,15 @@ yf_source_count = {
     "missing": 0,
 }
 
+# 這幾個欄位名稱會隨著使用者調整的秒數變動，整個畫面只需要算一次，
+# 資料整理迴圈與後面畫表格 / column_config 都共用同一組名稱。
+track_label = format_seconds_as_label(st.session_state.entry_track_sec)
+low_col_name = f"{track_label}低點"
+high_col_name = f"{track_label}高點"
+
+momentum_window_label = format_seconds_as_label(st.session_state.momentum_window_sec)
+momentum_col_name = f"{momentum_window_label}漲幅%"
+
 for group_name, stocks in st.session_state.stock_groups.items():
     rows = []
     pct_hit_count = 0
@@ -2371,6 +2702,8 @@ for group_name, stocks in st.session_state.stock_groups.items():
     warning_count = 0
     entry_count = 0
     flash_count = 0
+    day_low_rebound_count = 0
+    momentum_count = 0
     top_pct_items = []
     group_signal_messages = []
 
@@ -2405,6 +2738,30 @@ for group_name, stocks in st.session_state.stock_groups.items():
             "warning": False,
             "signal_level": "none",
             "text": "監控中",
+        }
+
+        day_low_signal = manager.get_day_low_rebound_signal(
+            symbol,
+            rebound_pct_threshold=st.session_state.day_low_rebound_pct,
+            cooldown_sec=st.session_state.day_low_rebound_cooldown_sec,
+        ) if manager is not None else {
+            "active": False,
+            "signal_level": "none",
+            "text": "尚未觸發",
+            "day_low": None,
+            "rebound_pct": None,
+        }
+
+        momentum_signal = manager.get_window_momentum_signal(
+            symbol,
+            window_sec=st.session_state.momentum_window_sec,
+            pct_threshold=st.session_state.momentum_window_pct,
+            cooldown_sec=st.session_state.momentum_cooldown_sec,
+        ) if manager is not None else {
+            "active": False,
+            "signal_level": "none",
+            "text": "尚未觸發",
+            "window_change_pct": None,
         }
 
         yesterday_close, close_date, yf_source = get_yfinance_yesterday_close(symbol)
@@ -2443,6 +2800,12 @@ for group_name, stocks in st.session_state.stock_groups.items():
         elif signal.get("flash"):
             flash_count += 1
 
+        if day_low_signal.get("active"):
+            day_low_rebound_count += 1
+
+        if momentum_signal.get("active"):
+            momentum_count += 1
+
         if signal.get("active") or signal.get("warning") or signal.get("flash"):
             signal_msg = {
                 "group": group_name,
@@ -2462,6 +2825,42 @@ for group_name, stocks in st.session_state.stock_groups.items():
             
             # --- 觸發 Telegram 推送 ---
             push_telegram_signal(group_name, code, stock_name, signal, change_pct)
+
+        if day_low_signal.get("active"):
+            day_low_signal_msg = {
+                "group": group_name,
+                "code": code,
+                "name": stock_name,
+                "text": day_low_signal.get("text", ""),
+                "time": day_low_signal.get("time"),
+                "pct": change_pct,
+                "level": day_low_signal.get("signal_level", "none"),
+            }
+
+            group_signal_messages.append(day_low_signal_msg)
+            recent_signals.append(day_low_signal_msg)
+
+            queue_entry_signal_toast(group_name, code, stock_name, day_low_signal, change_pct)
+            append_signal_log(group_name, code, stock_name, day_low_signal, change_pct)
+            push_telegram_signal(group_name, code, stock_name, day_low_signal, change_pct)
+
+        if momentum_signal.get("active"):
+            momentum_signal_msg = {
+                "group": group_name,
+                "code": code,
+                "name": stock_name,
+                "text": momentum_signal.get("text", ""),
+                "time": momentum_signal.get("time"),
+                "pct": change_pct,
+                "level": momentum_signal.get("signal_level", "none"),
+            }
+
+            group_signal_messages.append(momentum_signal_msg)
+            recent_signals.append(momentum_signal_msg)
+
+            queue_entry_signal_toast(group_name, code, stock_name, momentum_signal, change_pct)
+            append_signal_log(group_name, code, stock_name, momentum_signal, change_pct)
+            push_telegram_signal(group_name, code, stock_name, momentum_signal, change_pct)
 
         rows.append({
             "代碼": yahoo_quote_url(symbol),
@@ -2484,10 +2883,13 @@ for group_name, stocks in st.session_state.stock_groups.items():
             "5秒漲幅": format_signed_pct(signal.get("price_change_5s")),
             "10秒漲幅": format_signed_pct(signal.get("price_change_10s")),
             "30秒漲幅": format_signed_pct(signal.get("price_change_30s")),
-            "60秒低點": format_price_value(signal.get("low_track")),
-            "60秒高點": format_price_value(signal.get("high_track")),
+            low_col_name: format_price_value(signal.get("low_track")),
+            high_col_name: format_price_value(signal.get("high_track")),
             "低點拉抬": format_signed_pct(signal.get("rise_from_low_pct")),
             "高點回落": format_signed_pct(signal.get("drop_from_high_pct")),
+            "今日最低": format_price_value(day_low_signal.get("day_low")),
+            "今日低點反彈%": format_signed_pct(day_low_signal.get("rebound_pct")),
+            momentum_col_name: format_signed_pct(momentum_signal.get("window_change_pct")),
             "昨收日期": close_date or "-",
             "昨收來源": yf_source,
         })
@@ -2526,6 +2928,8 @@ for group_name, stocks in st.session_state.stock_groups.items():
         "warning_count": warning_count,
         "entry_count": entry_count,
         "flash_count": flash_count,
+        "day_low_rebound_count": day_low_rebound_count,
+        "momentum_count": momentum_count,
         "top_pct_text": top_pct_text,
         "signal_text": signal_text,
     })
@@ -2553,10 +2957,13 @@ for group_name, stocks in st.session_state.stock_groups.items():
             "5秒漲幅",
             "10秒漲幅",
             "30秒漲幅",
-            "60秒低點",
-            "60秒高點",
+            low_col_name,
+            high_col_name,
             "低點拉抬",
             "高點回落",
+            "今日最低",
+            "今日低點反彈%",
+            momentum_col_name,
             "昨收日期",
             "昨收來源",
         ],
@@ -2603,6 +3010,10 @@ for item in dashboard_items:
         card_class = "dash-card entry"
     elif item["warning_count"] > 0:
         card_class = "dash-card warn"
+    elif item["day_low_rebound_count"] > 0:
+        card_class = "dash-card daylow"
+    elif item["momentum_count"] > 0:
+        card_class = "dash-card momentum"
     elif item["flash_count"] > 0:
         card_class = "dash-card flash"
     elif item["pct_hit_count"] > 0:
@@ -2614,9 +3025,12 @@ for item in dashboard_items:
         f'<a href="#{anchor_id}" class="dashboard-link" title="前往 {escape_html(item["group"])}">'
         f'<div class="{card_class}">'
         f'<div class="dash-title">{escape_html(item["group"])}</div>'
-        f'<div class="dash-big">🚀 {item["entry_count"]}｜⚠️ {item["warning_count"]}｜🔥 {item["flash_count"]}</div>'
+        f'<div class="dash-big">🚀 {item["entry_count"]}｜⚠️ {item["warning_count"]}｜'
+        f'🔥 {item["flash_count"]}｜📈 {item["day_low_rebound_count"]}｜📊 {item["momentum_count"]}</div>'
         f'<div class="dash-line">進場訊號：<b>{item["entry_count"]}</b> 檔｜預警：<b>{item["warning_count"]}</b> 檔｜'
         f'極早期：<b>{item["flash_count"]}</b> 檔</div>'
+        f'<div class="dash-line">低點反彈：<b>{item["day_low_rebound_count"]}</b> 檔｜'
+        f'區間動能：<b>{item["momentum_count"]}</b> 檔</div>'
         f'<div class="dash-line">漲幅達標（≥{pct_threshold:.1f}%）：'
         f'<b>{item["pct_hit_count"]} / {item["total"]}</b>，比例 <b>{item["pct_hit_ratio"]:.0f}%</b></div>'
         f'<div class="dash-line">🔴 上漲：<b>{item["up_count"]}</b> '
@@ -2737,10 +3151,28 @@ for group_name, display_df in group_tables.items():
             "5秒漲幅": st.column_config.TextColumn("5秒漲幅"),
             "10秒漲幅": st.column_config.TextColumn("10秒漲幅"),
             "30秒漲幅": st.column_config.TextColumn("30秒漲幅"),
-            "60秒低點": st.column_config.TextColumn("60秒低點"),
-            "60秒高點": st.column_config.TextColumn("60秒高點"),
+            low_col_name: st.column_config.TextColumn(
+                low_col_name,
+                help=f"最近 {int(st.session_state.entry_track_sec)} 秒內的最低成交價，秒數可在左側「高低點追蹤秒」調整",
+            ),
+            high_col_name: st.column_config.TextColumn(
+                high_col_name,
+                help=f"最近 {int(st.session_state.entry_track_sec)} 秒內的最高成交價，秒數可在左側「高低點追蹤秒」調整",
+            ),
             "低點拉抬": st.column_config.TextColumn("低點拉抬"),
             "高點回落": st.column_config.TextColumn("高點回落"),
+            "今日最低": st.column_config.TextColumn(
+                "今日最低",
+                help="持續追蹤的當日最低成交價（不受高低點追蹤秒數影響，從開盤持續累積）",
+            ),
+            "今日低點反彈%": st.column_config.TextColumn(
+                "今日低點反彈%",
+                help="現價相較今日最低點的反彈幅度，達門檻觸發📈提醒",
+            ),
+            momentum_col_name: st.column_config.TextColumn(
+                momentum_col_name,
+                help="固定時間窗口內的漲幅，達門檻觸發📊區間動能提醒，視窗長度可在左側「動能視窗秒數」調整",
+            ),
             "昨收日期": st.column_config.TextColumn("昨收日期"),
             "昨收來源": st.column_config.TextColumn("昨收來源"),
         },
@@ -2799,6 +3231,19 @@ with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
             min_ticks_in_bucket=st.session_state.entry_min_ticks_in_bucket,
         )
 
+        debug_day_low_signal = manager.get_day_low_rebound_signal(
+            debug_code,
+            rebound_pct_threshold=st.session_state.day_low_rebound_pct,
+            cooldown_sec=st.session_state.day_low_rebound_cooldown_sec,
+        )
+
+        debug_momentum_signal = manager.get_window_momentum_signal(
+            debug_code,
+            window_sec=st.session_state.momentum_window_sec,
+            pct_threshold=st.session_state.momentum_window_pct,
+            cooldown_sec=st.session_state.momentum_cooldown_sec,
+        )
+
         st.markdown("### 訊號 Debug")
         st.json({
             "訊號": debug_signal.get("text"),
@@ -2814,8 +3259,8 @@ with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
             "5秒漲幅": debug_signal.get("price_change_5s"),
             "10秒漲幅": debug_signal.get("price_change_10s"),
             "30秒漲幅": debug_signal.get("price_change_30s"),
-            "60秒低點": debug_signal.get("low_track"),
-            "60秒高點": debug_signal.get("high_track"),
+            f"{track_label}低點": debug_signal.get("low_track"),
+            f"{track_label}高點": debug_signal.get("high_track"),
             "低點拉抬": debug_signal.get("rise_from_low_pct"),
             "突破高點": debug_signal.get("near_high_breakout"),
             "volume_ok": debug_signal.get("volume_ok"),
@@ -2823,6 +3268,25 @@ with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
             "short_momentum_ok": debug_signal.get("short_momentum_ok"),
             "position_ok": debug_signal.get("position_ok"),
             "flash": debug_signal.get("flash"),
+        })
+
+        st.markdown("### 📈 今日低點反彈 Debug")
+        st.json({
+            "訊號": debug_day_low_signal.get("text"),
+            "今日最低": debug_day_low_signal.get("day_low"),
+            "現價": debug_day_low_signal.get("current_price"),
+            "反彈%": debug_day_low_signal.get("rebound_pct"),
+            "門檻%": debug_day_low_signal.get("rebound_pct_threshold"),
+            "active": debug_day_low_signal.get("active"),
+        })
+
+        st.markdown("### 📊 區間動能 Debug")
+        st.json({
+            "訊號": debug_momentum_signal.get("text"),
+            "視窗": debug_momentum_signal.get("window_label"),
+            "視窗漲幅%": debug_momentum_signal.get("window_change_pct"),
+            "門檻%": debug_momentum_signal.get("pct_threshold"),
+            "active": debug_momentum_signal.get("active"),
         })
 
     else:
