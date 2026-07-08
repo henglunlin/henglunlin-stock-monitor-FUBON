@@ -1702,7 +1702,7 @@ def show_pending_toasts():
 
     if messages:
         for msg in messages[-5:]:
-            st.toast(msg, icon="🚀", duration="long")
+            st.toast(msg, icon="🚀", duration="15")
         st.session_state._entry_signal_toast_messages = []
 
 
