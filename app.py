@@ -66,30 +66,49 @@ YF_CLOSE_CACHE_TTL_SEC = 3600
 # 進場訊號預設參數
 DEFAULT_ENTRY_BUCKET_SEC = 30
 DEFAULT_ENTRY_TRACK_SEC = 60
-DEFAULT_ENTRY_VOLUME_RATIO = 1.3
+DEFAULT_ENTRY_VOLUME_RATIO = 1.1
 DEFAULT_ENTRY_PRICE_MOVE_PCT = 2.0
 DEFAULT_EARLY_5S_PCT = 0.8
 DEFAULT_EARLY_10S_PCT = 1.2
-DEFAULT_BUY_PRESSURE_RATIO = 0.40
+DEFAULT_BUY_PRESSURE_RATIO = 0.55
 DEFAULT_SIGNAL_COOLDOWN_SEC = 45
 DEFAULT_MIN_CURRENT_VOLUME = 20
 
-DEFAULT_EARLY_2S_PCT = 0.5
-DEFAULT_TICK_JUMP_PCT = 0.5
+# --- 🔥 極早期訊號（flash）---
+# 依 2026-07-09 實測 log（8883筆訊號）分析：極早期訊號筆數佔全部訊號43%，
+# 是量最大的一層，但15分鐘後續最高漲幅變化的中位數是 0.00%、只有23.8%
+# 之後續漲、且僅3.9%會在5分鐘內轉化成預警/進場，訊號品質明顯偏弱。
+# 觀察觸發當下的單筆跳動幅度中位數已達0.86%（不是卡在門檻邊緣），代表
+# 問題不在門檻高低，而在於「單一一筆」本身就容易是雜訊；因此除了把門檻
+# 從0.5%略調高到0.8%之外，同時在程式邏輯加上「連續兩筆外盤買」的確認
+# （見 _recent_ticks_all_buy），並新增獨立冷卻秒數避免同一波雜訊連環觸發。
+DEFAULT_EARLY_2S_PCT = 0.8
+DEFAULT_TICK_JUMP_PCT = 0.8
 DEFAULT_MIN_TICKS_IN_BUCKET = 2
+DEFAULT_FLASH_COOLDOWN_SEC = 45
 BUCKET_ELAPSED_FLOOR_SEC = 3.0
 
-# --- 今日最低點反彈偵測 ---
-# 從開盤持續追蹤當天最低成交價，現價相較今日最低點反彈達此門檻即觸發提醒
-DEFAULT_DAY_LOW_REBOUND_PCT = 2.0
-# 同一檔股票的低點反彈提醒冷卻秒數，避免在低點附近來回震盪時洗版
-DEFAULT_DAY_LOW_REBOUND_COOLDOWN_SEC = 60
+# --- 📈 今日最低點反彈偵測 ---
+# 依實測 log 分析：低點反彈訊號筆數佔全部訊號46%（單日8883筆中就有4077筆），
+# 是最大量的來源；把訊號依實際反彈幅度分桶比對15分鐘後續表現發現，
+# 反彈落在1~2%區間的（佔比過半）後續轉正比例只有53%、中位數僅+0.17%，
+# 反彈達2~3%以上的區間則明顯轉好（轉正比例62%、中位數+0.40%）。
+# 另外同一檔股票相鄰兩次觸發的間隔，有49%落在65秒內（等於冷卻一過就
+# 馬上再觸發），確認60秒冷卻太短、造成同一檔股票反覆洗版。
+# 因此把門檻從2.0%上調到3.0%、冷卻從60秒拉長到240秒，同時砍掉大量
+# 低品質訊號、又保留真正有意義的反彈。
+DEFAULT_DAY_LOW_REBOUND_PCT = 3.0
+DEFAULT_DAY_LOW_REBOUND_COOLDOWN_SEC = 240
 
-# --- 中期動能偵測（預設：3分鐘內上漲1.5%）---
-# 和 5秒/10秒/30秒的瞬間拉抬判斷不同，這是抓「一段時間內持續緩步走高」的走勢
+# --- 📊 中期動能偵測（預設：3分鐘內上漲1.5%）---
+# 和 5秒/10秒/30秒的瞬間拉抬判斷不同，這是抓「一段時間內持續緩步走高」的走勢。
+# 依實測 log 分析：這是四層中品質最好的獨立訊號——15分鐘後續轉正比例
+# 達67.4%（僅次於進場/預警的72%），且21.5%會在5分鐘內轉化成預警/進場
+# （遠高於極早期的3.9%、低點反彈的9.1%），維持原本的視窗與漲幅門檻，
+# 只把冷卻秒數從60小幅拉長到90秒，降低少量重複洗版但不影響原有品質。
 DEFAULT_MOMENTUM_WINDOW_SEC = 180
 DEFAULT_MOMENTUM_WINDOW_PCT = 1.5
-DEFAULT_MOMENTUM_COOLDOWN_SEC = 60
+DEFAULT_MOMENTUM_COOLDOWN_SEC = 90
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -976,6 +995,9 @@ class FubonRealtimeManager:
             "momentum_state": {
                 "last_signal_at": None,
             },
+            "flash_state": {
+                "last_signal_at": None,
+            },
         }
 
     def _on_message(self, message):
@@ -1010,6 +1032,9 @@ class FubonRealtimeManager:
             if "momentum_state" not in status:
                 status["momentum_state"] = self._default_status()["momentum_state"]
 
+            if "flash_state" not in status:
+                status["flash_state"] = self._default_status()["flash_state"]
+
             if price is not None:
                 status["last_ws_price"] = price
 
@@ -1025,9 +1050,6 @@ class FubonRealtimeManager:
                     and (now - p.get("time")).total_seconds() <= 400
                 ][-1500:]
 
-                # 持續追蹤「今日」最低成交價。用日期字串判斷是否跨日，
-                # 跨日（或第一次收到這檔的報價）就重新從目前這筆價格開始記錄，
-                # 同一天內則只要出現更低的價格就更新。
                 today_str = now.strftime("%Y%m%d")
                 existing_day_low = status.get("day_low")
                 existing_day_low_date = status.get("day_low_date")
@@ -1215,6 +1237,27 @@ class FubonRealtimeManager:
 
         return (float(current_price) / float(prev_price) - 1) * 100
 
+    def _recent_ticks_all_buy(self, recent_ticks, min_consecutive=2):
+        """
+        檢查最近 N 筆成交是否「連續」都是外盤買。用來加強 🔥 極早期訊號的
+        確認條件：根據實測 log 分析，單一一筆買盤跳動很常是雜訊（常見於
+        小單、掛價瞬間成交），15分鐘後續漲幅中位數幾乎是 0%；改成至少
+        連續兩筆外盤買，可以濾掉大部分一次性雜訊，同時仍保有反應速度。
+        資料不足兩筆時（新股票剛開始監控）放行，避免完全擋住。
+        """
+        valid_ticks = [
+            t for t in recent_ticks
+            if hasattr(t.get("time"), "timestamp")
+        ]
+
+        if len(valid_ticks) < min_consecutive:
+            return True
+
+        valid_ticks.sort(key=lambda x: x.get("time"))
+        last_n = valid_ticks[-min_consecutive:]
+
+        return all(t.get("type") == "外盤(買)" for t in last_n)
+
     def get_entry_signal(
         self,
         symbol: str,
@@ -1230,6 +1273,7 @@ class FubonRealtimeManager:
         early_2s_pct: float = DEFAULT_EARLY_2S_PCT,
         tick_jump_pct: float = DEFAULT_TICK_JUMP_PCT,
         min_ticks_in_bucket: int = DEFAULT_MIN_TICKS_IN_BUCKET,
+        flash_cooldown_sec: int = DEFAULT_FLASH_COOLDOWN_SEC,
     ):
         code = symbol_to_code(symbol)
         now = datetime.now(TW_TZ)
@@ -1295,6 +1339,11 @@ class FubonRealtimeManager:
         except Exception:
             min_ticks_in_bucket = DEFAULT_MIN_TICKS_IN_BUCKET
 
+        try:
+            flash_cooldown_sec = max(0, int(flash_cooldown_sec))
+        except Exception:
+            flash_cooldown_sec = DEFAULT_FLASH_COOLDOWN_SEC
+
         with self.lock:
             status = copy.deepcopy(self.tick_status.get(code, self._default_status()))
 
@@ -1302,6 +1351,7 @@ class FubonRealtimeManager:
         recent_ticks = status.get("recent_ticks", [])
         price_points = status.get("price_points", [])
         entry_state = status.get("entry_state") or self._default_status()["entry_state"]
+        flash_state = status.get("flash_state") or self._default_status()["flash_state"]
 
         bucket_start_ts = int(now_ts // bucket_sec) * bucket_sec
         previous_bucket_start_ts = bucket_start_ts - bucket_sec
@@ -1448,15 +1498,34 @@ class FubonRealtimeManager:
             and cooldown_ok
         )
 
+        flash_last_signal_at = flash_state.get("last_signal_at")
+        flash_cooldown_ok = True
+
+        if hasattr(flash_last_signal_at, "timestamp"):
+            flash_cooldown_ok = (now - flash_last_signal_at).total_seconds() >= flash_cooldown_sec
+
+        # 根據實測 log 分析：單筆買盤跳動很常是雜訊，15分鐘後續漲幅中位數
+        # 幾乎是 0%，遠低於其他三層。改成要求「連續兩筆」都是外盤買，
+        # 並加上獨立冷卻，大幅降低洗版式的極早期訊號同時保留即時性。
+        flash_confirmed = self._recent_ticks_all_buy(recent_ticks, min_consecutive=2)
+
         flash_active = (
             not entry_active
             and not warning_active
             and last_trade_type == "外盤(買)"
+            and flash_confirmed
+            and flash_cooldown_ok
             and (
                 (last_tick_jump_pct is not None and last_tick_jump_pct >= tick_jump_pct)
                 or (price_change_2s is not None and price_change_2s >= early_2s_pct)
             )
         )
+
+        if flash_active:
+            flash_state["last_signal_at"] = now
+
+            with self.lock:
+                self.tick_status.setdefault(code, self._default_status())["flash_state"] = flash_state
 
         if entry_active:
             entry_state["last_signal_at"] = now
@@ -1552,12 +1621,6 @@ class FubonRealtimeManager:
         rebound_pct_threshold: float = DEFAULT_DAY_LOW_REBOUND_PCT,
         cooldown_sec: int = DEFAULT_DAY_LOW_REBOUND_COOLDOWN_SEC,
     ):
-        """
-        獨立於量能/外盤占比之外的判斷標準之一：
-        不斷記錄「今日」最低成交價，現價相較今日最低點的反彈幅度
-        一旦達到門檻，就觸發提醒。條件單純只看價格，不要求量能或外盤占比，
-        用來捕捉「盤中破底後止穩反彈」這種和瞬間拉抬不同類型的機會。
-        """
         code = symbol_to_code(symbol)
         now = datetime.now(TW_TZ)
 
@@ -1631,12 +1694,6 @@ class FubonRealtimeManager:
         pct_threshold: float = DEFAULT_MOMENTUM_WINDOW_PCT,
         cooldown_sec: int = DEFAULT_MOMENTUM_COOLDOWN_SEC,
     ):
-        """
-        獨立於量能/外盤占比之外的判斷標準之二：
-        固定觀察一段較長的時間窗口（預設3分鐘＝180秒），只要現價相較窗口
-        起點的漲幅達到門檻，就觸發提醒。跟 5秒/10秒 的瞬間拉抬判斷不同，
-        這個是用來抓「沒有單筆爆量、但股價持續緩步走高」的中期動能走勢。
-        """
         code = symbol_to_code(symbol)
         now = datetime.now(TW_TZ)
 
@@ -1778,8 +1835,24 @@ def send_telegram_message(text: str):
     except Exception as e:
         st.error(f"Telegram 連線失敗: {e}")
 
+
+def send_telegram_document(file_path: str, caption: str = ""):
+    """發送檔案到 Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+    try:
+        with open(file_path, "rb") as f:
+            files = {"document": f}
+            res = requests.post(url, data=payload, files=files, timeout=10)
+            if res.status_code != 200:
+                st.error(f"Telegram 檔案傳送失敗，API 回傳：{res.text}")
+    except Exception as e:
+        st.error(f"Telegram 檔案連線失敗: {e}")
+
+
 def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
-    # 檢查開關是否開啟
     if not st.session_state.tg_push_enabled:
         return
 
@@ -1825,7 +1898,6 @@ def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
         f"{signal.get('text', '')}"
     )
 
-    # 利用 Thread 傳送避免阻塞介面，並且注入 context 讓 st.error 可以在背景正常運作
     t = threading.Thread(target=send_telegram_message, args=(msg,))
     add_script_run_ctx(t)
     t.start()
@@ -1950,6 +2022,9 @@ if "entry_tick_jump_pct" not in st.session_state:
 if "entry_min_ticks_in_bucket" not in st.session_state:
     st.session_state.entry_min_ticks_in_bucket = DEFAULT_MIN_TICKS_IN_BUCKET
 
+if "entry_flash_cooldown_sec" not in st.session_state:
+    st.session_state.entry_flash_cooldown_sec = DEFAULT_FLASH_COOLDOWN_SEC
+
 if "day_low_rebound_pct" not in st.session_state:
     st.session_state.day_low_rebound_pct = DEFAULT_DAY_LOW_REBOUND_PCT
 
@@ -2002,6 +2077,12 @@ if "_entry_signal_toast_messages" not in st.session_state:
 
 if "telegram_pushed_keys" not in st.session_state:
     st.session_state.telegram_pushed_keys = set()
+    
+# 新增：用於記錄已發送過的定時 Log 時段，避免重複發送
+if "sent_log_slots" not in st.session_state:
+    st.session_state.sent_log_slots = set()
+if "log_date" not in st.session_state:
+    st.session_state.log_date = datetime.now(TW_TZ).date()
 
 
 def show_pending_toasts():
@@ -2421,7 +2502,7 @@ else:
 # =============================================================================
 # 主畫面頂端控制列 (僅保留基本操作與漲幅門檻)
 # =============================================================================
-control_cols = st.columns(5) # 將原本的 14 欄縮減為 5 欄
+control_cols = st.columns(5) 
 
 with control_cols[0]:
     if st.button("🔄 手動刷新", width="stretch"):
@@ -2470,6 +2551,7 @@ with st.sidebar.expander("⚙️ 參數設定", expanded=True):
     st.number_input("2秒預警%", min_value=0.1, max_value=5.0, step=0.1, key="entry_early_2s_pct", help="極短窗口漲幅門檻，比5秒窗更快抓到瞬間拉抬")
     st.number_input("單筆跳動%", min_value=0.1, max_value=5.0, step=0.1, key="entry_tick_jump_pct", help="最新一筆成交價相較上一筆的漲幅，抓單筆巨量瞬間跳價（🔥極早期訊號用）")
     st.number_input("視窗最少筆數", min_value=1, max_value=20, step=1, key="entry_min_ticks_in_bucket", help="量能視窗內至少要有幾筆成交才算數，避免單一大單誤觸發")
+    st.number_input("極早期冷卻秒數", min_value=0, max_value=300, step=5, key="entry_flash_cooldown_sec", help="🔥極早期訊號同一檔股票的最短觸發間隔。實測log顯示單筆跳動很容易連環觸發，加上獨立冷卻可大幅降低洗版")
 
     st.markdown("---")
     st.markdown("**📈 今日低點反彈提醒**")
@@ -2531,13 +2613,17 @@ if status["error"]:
 
 st.info(
     "訊號邏輯（四種判斷標準，彼此獨立，可同時出現）：\n"
-    "🔥 極早期訊號：最新一筆是外盤買，且單筆跳動或2秒漲幅已達標，最快、雜訊也最多，僅供提早注意。\n"
+    "🔥 極早期訊號：最新一筆連續兩筆都是外盤買，且單筆跳動或2秒漲幅已達標，最快、雜訊也最多，僅供提早注意。\n"
     "⚠️ 預警：量能達標＋外盤占比達標＋2/5/10秒任一短線漲幅達標。\n"
     f"🚀 進場訊號：預警條件全部成立，再加上{int(st.session_state.entry_bucket_sec)}秒漲幅或"
     f"{int(st.session_state.entry_track_sec)}秒突破高點/低點急拉確認，並通過冷卻時間。\n"
     "📈 今日低點反彈：不斷記錄當天最低成交價，現價相較今日最低點反彈達門檻即觸發，純看價格、不看量能，用來抓破底後止穩反彈。\n"
     "📊 區間動能：固定觀察一段時間窗口（預設3分鐘）的漲幅，抓沒有單筆爆量、但持續緩步走高的走勢。\n"
-    "🔔 Telegram 推送：推送「預警」「進場訊號」「今日低點反彈」「區間動能」四種提醒至綁定的群組。"
+    "🔔 Telegram 推送：推送「預警」「進場訊號」「今日低點反彈」「區間動能」四種提醒至綁定的群組（🔥極早期不推送，僅記錄於log）。\n\n"
+    "📊 依 2026-07-09 實測 8883 筆訊號log分析調整：極早期訊號原佔比43%但15分鐘後續轉正比例僅23.8%（中位數0%），"
+    "已加強為需連續兩筆買盤＋獨立冷卻；低點反彈原佔比46%但1~2%反彈區間後續轉正僅53%，已將門檻由2.0%提高到3.0%、"
+    "冷卻由60秒拉長到240秒（原本49%的重複觸發間隔都在65秒內，等於冷卻一過就馬上再觸發）；"
+    "區間動能經驗證是品質最好的獨立訊號（15分鐘後續轉正67.4%，5分鐘內轉化成預警/進場的比例21.5%，遠高於極早期3.9%與低點反彈9.1%），維持原本門檻。"
 )
 
 st.caption(
@@ -2552,6 +2638,7 @@ st.caption(
     f"高低點追蹤 {int(st.session_state.entry_track_sec)} 秒｜"
     f"最低本段量 {int(st.session_state.entry_min_current_volume)} 張｜"
     f"視窗最少筆數 {int(st.session_state.entry_min_ticks_in_bucket)} 筆｜"
+    f"極早期冷卻 {int(st.session_state.entry_flash_cooldown_sec)} 秒｜"
     f"冷卻 {int(st.session_state.entry_cooldown_sec)} 秒｜"
     f"今日低點反彈 ≥ {float(st.session_state.day_low_rebound_pct):.1f}%（冷卻 {int(st.session_state.day_low_rebound_cooldown_sec)} 秒）｜"
     f"區間動能 {format_seconds_as_label(st.session_state.momentum_window_sec)}內 ≥ "
@@ -2573,8 +2660,6 @@ yf_source_count = {
     "missing": 0,
 }
 
-# 這幾個欄位名稱會隨著使用者調整的秒數變動，整個畫面只需要算一次，
-# 資料整理迴圈與後面畫表格 / column_config 都共用同一組名稱。
 track_label = format_seconds_as_label(st.session_state.entry_track_sec)
 low_col_name = f"{track_label}低點"
 high_col_name = f"{track_label}高點"
@@ -2622,6 +2707,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
             early_2s_pct=st.session_state.entry_early_2s_pct,
             tick_jump_pct=st.session_state.entry_tick_jump_pct,
             min_ticks_in_bucket=st.session_state.entry_min_ticks_in_bucket,
+            flash_cooldown_sec=st.session_state.entry_flash_cooldown_sec,
         ) if manager is not None else {
             "active": False,
             "warning": False,
@@ -3118,6 +3204,7 @@ with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
             early_2s_pct=st.session_state.entry_early_2s_pct,
             tick_jump_pct=st.session_state.entry_tick_jump_pct,
             min_ticks_in_bucket=st.session_state.entry_min_ticks_in_bucket,
+            flash_cooldown_sec=st.session_state.entry_flash_cooldown_sec,
         )
 
         debug_day_low_signal = manager.get_day_low_rebound_signal(
@@ -3180,6 +3267,53 @@ with st.sidebar.expander("🔍 WebSocket Debug", expanded=False):
 
     else:
         st.caption("尚未收到此代碼的 WebSocket 訊息")
+
+
+# =============================================================================
+# 定時推送 Log 到 Telegram (指定盤中時間)
+# =============================================================================
+# 無視 tg_push_enabled 開關，直接執行定時推送邏輯
+now = datetime.now(TW_TZ)
+
+# 跨日重置已發送紀錄
+if "log_date" not in st.session_state or st.session_state.log_date != now.date():
+    st.session_state.sent_log_slots = set()
+    st.session_state.log_date = now.date()
+
+# 定義要發送的目標時間 (小時, 分鐘)
+target_times = [
+    (9, 30), (10, 0), (10, 30), (11, 0), (11, 30),
+    (12, 0), (12, 30), (13, 0), (13, 30)
+]
+
+now_hm = now.hour * 60 + now.minute
+
+for t_h, t_m in target_times:
+    target_hm = t_h * 60 + t_m
+    
+    # 檢查現在時間是否在目標時間的正負 1 分鐘內 (相差 <= 1 分鐘)
+    if abs(now_hm - target_hm) <= 1:
+        slot_id = f"{t_h:02d}:{t_m:02d}"
+        
+        # 確保同一個時段只發送一次
+        if slot_id not in st.session_state.get("sent_log_slots", set()):
+            _, today_log_path = read_signal_log()
+            
+            # 確保今天有產生 log 檔案才發送
+            if os.path.exists(today_log_path):
+                def push_log_task(path, slot):
+                    send_telegram_document(
+                        file_path=path,
+                        caption=f"🕒 定時回報：{slot} 訊號 Log"
+                    )
+                
+                # 使用 Thread 避免阻塞 Streamlit 主線程
+                t = threading.Thread(target=push_log_task, args=(today_log_path, slot_id))
+                add_script_run_ctx(t)
+                t.start()
+            
+            # 記錄已發送，避免這兩分鐘內畫面刷新導致重複發送
+            st.session_state.setdefault("sent_log_slots", set()).add(slot_id)
 
 
 # =============================================================================
