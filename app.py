@@ -991,6 +991,7 @@ class FubonRealtimeManager:
             },
             "day_low_rebound_state": {
                 "last_signal_at": None,
+                "last_signal_day_low": None, # 新增：記錄上次觸發的日低點
             },
             "momentum_state": {
                 "last_signal_at": None,
@@ -1003,6 +1004,13 @@ class FubonRealtimeManager:
     def _on_message(self, message):
         msg = self._parse_message(message)
         now = datetime.now(TW_TZ)
+
+        # 💡 新增：過濾掉 09:00 前的「盤前試撮」資料，避免污染低點與量能
+        if now.hour < 9:
+            # 為了讓 UI 儀表板仍能顯示連線存活狀態，可選擇更新最後訊息時間，但不處理實質數據
+            with self.lock:
+                self.last_message_at = now
+            return
 
         symbol = self._extract_symbol(msg)
         price = self._extract_price(msg)
@@ -1238,13 +1246,6 @@ class FubonRealtimeManager:
         return (float(current_price) / float(prev_price) - 1) * 100
 
     def _recent_ticks_all_buy(self, recent_ticks, min_consecutive=2):
-        """
-        檢查最近 N 筆成交是否「連續」都是外盤買。用來加強 🔥 極早期訊號的
-        確認條件：根據實測 log 分析，單一一筆買盤跳動很常是雜訊（常見於
-        小單、掛價瞬間成交），15分鐘後續漲幅中位數幾乎是 0%；改成至少
-        連續兩筆外盤買，可以濾掉大部分一次性雜訊，同時仍保有反應速度。
-        資料不足兩筆時（新股票剛開始監控）放行，避免完全擋住。
-        """
         valid_ticks = [
             t for t in recent_ticks
             if hasattr(t.get("time"), "timestamp")
@@ -1504,9 +1505,6 @@ class FubonRealtimeManager:
         if hasattr(flash_last_signal_at, "timestamp"):
             flash_cooldown_ok = (now - flash_last_signal_at).total_seconds() >= flash_cooldown_sec
 
-        # 根據實測 log 分析：單筆買盤跳動很常是雜訊，15分鐘後續漲幅中位數
-        # 幾乎是 0%，遠低於其他三層。改成要求「連續兩筆」都是外盤買，
-        # 並加上獨立冷卻，大幅降低洗版式的極早期訊號同時保留即時性。
         flash_confirmed = self._recent_ticks_all_buy(recent_ticks, min_consecutive=2)
 
         flash_active = (
@@ -1640,8 +1638,11 @@ class FubonRealtimeManager:
         current_price = status.get("last_ws_price")
         day_low = status.get("day_low")
         day_low_at = status.get("day_low_at")
-        rebound_state = status.get("day_low_rebound_state") or {"last_signal_at": None}
+        
+        # 取得紀錄的狀態，包含上次觸發時的日低點
+        rebound_state = status.get("day_low_rebound_state") or {"last_signal_at": None, "last_signal_day_low": None}
         last_signal_at = rebound_state.get("last_signal_at")
+        last_signal_day_low = rebound_state.get("last_signal_day_low")
 
         rebound_pct = None
         cooldown_ok = True
@@ -1653,10 +1654,24 @@ class FubonRealtimeManager:
 
         if current_price is not None and day_low is not None and day_low > 0:
             rebound_pct = (float(current_price) / float(day_low) - 1) * 100
-            active = rebound_pct >= rebound_pct_threshold and cooldown_ok
+            
+            # 【修正邏輯 1】如果價格大幅回落（反彈幅度跌回門檻的一半以下），重置紀錄。
+            # 這允許股價在「沒破底」的情況下，若回測低點後再次往上拉抬，依然能精準捕捉雙底反彈。
+            if rebound_pct < (rebound_pct_threshold * 0.5):
+                rebound_state["last_signal_day_low"] = None
+                last_signal_day_low = None
+                with self.lock:
+                    self.tick_status.setdefault(code, self._default_status())["day_low_rebound_state"] = rebound_state
+
+            # 【修正邏輯 2】確認「目前的日低點」跟「上次發送訊號的日低點」是否不同（或已經被重置）。
+            # 藉此防堵股價攻上漲停或維持高檔時，只是因為數值大於門檻，就每 240 秒狂跳洗版。
+            is_new_trigger = (last_signal_day_low != day_low)
+            
+            active = rebound_pct >= rebound_pct_threshold and cooldown_ok and is_new_trigger
 
         if active:
             rebound_state["last_signal_at"] = now
+            rebound_state["last_signal_day_low"] = day_low
 
             with self.lock:
                 self.tick_status.setdefault(code, self._default_status())["day_low_rebound_state"] = rebound_state
