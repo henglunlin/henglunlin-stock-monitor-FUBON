@@ -2569,7 +2569,7 @@ with control_cols[4]:
 # =============================================================================
 # 左側欄位：參數設定區塊
 # =============================================================================
-with st.sidebar.expander("⚙️ 參數設定", expanded=True):
+with st.sidebar.expander("⚙️ 參數設定", expanded=False):
     
     st.markdown("**🚨 漲/跌停預警**")
     st.number_input("漲跌停預警門檻%", min_value=1.0, max_value=10.0, step=0.5, key="limit_approach_pct", help="距離漲跌停的預警門檻（正負同值，預設 7.5%）")
