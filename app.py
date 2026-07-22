@@ -15,6 +15,7 @@
 7. 分成「預警」與「進場訊號」。
 8. 修正儀表板 HTML anchor UI 問題。
 9. 整合 Telegram 推播開關與 st.secrets 預設值讀取功能。
+10. 整合「即將漲停」、「即將跌停」預警機制與 30 分鐘推播冷卻。
 """
 
 import os
@@ -75,13 +76,6 @@ DEFAULT_SIGNAL_COOLDOWN_SEC = 45
 DEFAULT_MIN_CURRENT_VOLUME = 20
 
 # --- 🔥 極早期訊號（flash）---
-# 依 2026-07-09 實測 log（8883筆訊號）分析：極早期訊號筆數佔全部訊號43%，
-# 是量最大的一層，但15分鐘後續最高漲幅變化的中位數是 0.00%、只有23.8%
-# 之後續漲、且僅3.9%會在5分鐘內轉化成預警/進場，訊號品質明顯偏弱。
-# 觀察觸發當下的單筆跳動幅度中位數已達0.86%（不是卡在門檻邊緣），代表
-# 問題不在門檻高低，而在於「單一一筆」本身就容易是雜訊；因此除了把門檻
-# 從0.5%略調高到0.8%之外，同時在程式邏輯加上「連續兩筆外盤買」的確認
-# （見 _recent_ticks_all_buy），並新增獨立冷卻秒數避免同一波雜訊連環觸發。
 DEFAULT_EARLY_2S_PCT = 0.8
 DEFAULT_TICK_JUMP_PCT = 0.8
 DEFAULT_MIN_TICKS_IN_BUCKET = 2
@@ -89,26 +83,28 @@ DEFAULT_FLASH_COOLDOWN_SEC = 45
 BUCKET_ELAPSED_FLOOR_SEC = 3.0
 
 # --- 📈 今日最低點反彈偵測 ---
-# 依實測 log 分析：低點反彈訊號筆數佔全部訊號46%（單日8883筆中就有4077筆），
-# 是最大量的來源；把訊號依實際反彈幅度分桶比對15分鐘後續表現發現，
-# 反彈落在1~2%區間的（佔比過半）後續轉正比例只有53%、中位數僅+0.17%，
-# 反彈達2~3%以上的區間則明顯轉好（轉正比例62%、中位數+0.40%）。
-# 另外同一檔股票相鄰兩次觸發的間隔，有49%落在65秒內（等於冷卻一過就
-# 馬上再觸發），確認60秒冷卻太短、造成同一檔股票反覆洗版。
-# 因此把門檻從2.0%上調到3.0%、冷卻從60秒拉長到240秒，同時砍掉大量
-# 低品質訊號、又保留真正有意義的反彈。
 DEFAULT_DAY_LOW_REBOUND_PCT = 3.0
 DEFAULT_DAY_LOW_REBOUND_COOLDOWN_SEC = 240
 
-# --- 📊 中期動能偵測（預設：3分鐘內上漲1.5%）---
-# 和 5秒/10秒/30秒的瞬間拉抬判斷不同，這是抓「一段時間內持續緩步走高」的走勢。
-# 依實測 log 分析：這是四層中品質最好的獨立訊號——15分鐘後續轉正比例
-# 達67.4%（僅次於進場/預警的72%），且21.5%會在5分鐘內轉化成預警/進場
-# （遠高於極早期的3.9%、低點反彈的9.1%），維持原本的視窗與漲幅門檻，
-# 只把冷卻秒數從60小幅拉長到90秒，降低少量重複洗版但不影響原有品質。
+# --- 📊 中期動能偵測 ---
 DEFAULT_MOMENTUM_WINDOW_SEC = 180
 DEFAULT_MOMENTUM_WINDOW_PCT = 1.5
 DEFAULT_MOMENTUM_COOLDOWN_SEC = 90
+
+# --- 🚨 漲跌停預警參數 ---
+DEFAULT_LIMIT_APPROACH_PCT = 7.5
+DEFAULT_LIMIT_APPROACH_COOLDOWN_SEC = 1800  # 30分鐘冷卻
+
+# --- 📲 Telegram 推送優先順序過濾 ---
+DEFAULT_TG_PRIORITY_WINDOW_SEC = 30
+TG_SIGNAL_PRIORITY = {
+    "limit_up": 6,        # 📈 即將漲停
+    "limit_down": 5,      # 📉 即將跌停
+    "entry": 4,           # 🚀 進場訊號
+    "momentum_window": 3, # 📊 區間動能
+    "day_low_rebound": 2, # 📈 低點反彈
+    "warning": 1,         # ⚠️ 預警
+}
 
 DEFAULT_STOCK_GROUPS = {
     "權值股": [
@@ -376,11 +372,6 @@ def format_percent_ratio(value):
 
 
 def format_seconds_as_label(total_seconds):
-    """
-    把秒數轉成好讀的標籤：60的整數倍顯示「N分鐘」，否則顯示「N秒」。
-    用在「60秒高低點」這類欄位名稱上，讓標籤跟著使用者調整的秒數走，
-    而不是永遠寫死顯示 60。
-    """
     try:
         total_seconds = int(total_seconds)
     except Exception:
@@ -991,7 +982,7 @@ class FubonRealtimeManager:
             },
             "day_low_rebound_state": {
                 "last_signal_at": None,
-                "last_signal_day_low": None, # 新增：記錄上次觸發的日低點
+                "last_signal_day_low": None,
             },
             "momentum_state": {
                 "last_signal_at": None,
@@ -1005,9 +996,7 @@ class FubonRealtimeManager:
         msg = self._parse_message(message)
         now = datetime.now(TW_TZ)
 
-        # 💡 新增：過濾掉 09:00 前的「盤前試撮」資料，避免污染低點與量能
         if now.hour < 9:
-            # 為了讓 UI 儀表板仍能顯示連線存活狀態，可選擇更新最後訊息時間，但不處理實質數據
             with self.lock:
                 self.last_message_at = now
             return
@@ -1639,7 +1628,6 @@ class FubonRealtimeManager:
         day_low = status.get("day_low")
         day_low_at = status.get("day_low_at")
         
-        # 取得紀錄的狀態，包含上次觸發時的日低點
         rebound_state = status.get("day_low_rebound_state") or {"last_signal_at": None, "last_signal_day_low": None}
         last_signal_at = rebound_state.get("last_signal_at")
         last_signal_day_low = rebound_state.get("last_signal_day_low")
@@ -1655,16 +1643,12 @@ class FubonRealtimeManager:
         if current_price is not None and day_low is not None and day_low > 0:
             rebound_pct = (float(current_price) / float(day_low) - 1) * 100
             
-            # 【修正邏輯 1】如果價格大幅回落（反彈幅度跌回門檻的一半以下），重置紀錄。
-            # 這允許股價在「沒破底」的情況下，若回測低點後再次往上拉抬，依然能精準捕捉雙底反彈。
             if rebound_pct < (rebound_pct_threshold * 0.5):
                 rebound_state["last_signal_day_low"] = None
                 last_signal_day_low = None
                 with self.lock:
                     self.tick_status.setdefault(code, self._default_status())["day_low_rebound_state"] = rebound_state
 
-            # 【修正邏輯 2】確認「目前的日低點」跟「上次發送訊號的日低點」是否不同（或已經被重置）。
-            # 藉此防堵股價攻上漲停或維持高檔時，只是因為數值大於門檻，就每 240 秒狂跳洗版。
             is_new_trigger = (last_signal_day_low != day_low)
             
             active = rebound_pct >= rebound_pct_threshold and cooldown_ok and is_new_trigger
@@ -1852,7 +1836,6 @@ def send_telegram_message(text: str):
 
 
 def send_telegram_document(file_path: str, caption: str = ""):
-    """發送檔案到 Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
@@ -1876,7 +1859,7 @@ def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
 
     level = signal.get("signal_level", "none")
     
-    if level not in ("warning", "entry", "day_low_rebound", "momentum_window"):
+    if level not in ("warning", "entry", "day_low_rebound", "momentum_window", "limit_up", "limit_down"):
         return
 
     signal_key = signal.get("signal_key")
@@ -1887,16 +1870,36 @@ def push_telegram_signal(group_name, code, stock_name, signal, change_pct):
     if signal_key in pushed_keys:
         return
 
+    signal_time = signal.get("time") or datetime.now(TW_TZ)
+
+    priority = TG_SIGNAL_PRIORITY.get(level, 0)
+    recent_push_map = st.session_state.telegram_recent_push_by_code
+    recent_push = recent_push_map.get(code)
+
+    if recent_push is not None:
+        elapsed = abs((signal_time - recent_push["time"]).total_seconds())
+        if elapsed < DEFAULT_TG_PRIORITY_WINDOW_SEC and priority <= recent_push["priority"]:
+            pushed_keys.add(signal_key)
+            if len(pushed_keys) > 2000:
+                st.session_state.telegram_pushed_keys = set(list(pushed_keys)[-1000:])
+            return
+
     pushed_keys.add(signal_key)
     if len(pushed_keys) > 2000:
         st.session_state.telegram_pushed_keys = set(list(pushed_keys)[-1000:])
 
-    signal_time = signal.get("time")
+    recent_push_map[code] = {
+        "time": signal_time,
+        "priority": priority,
+        "level": level,
+    }
     time_text = signal_time.strftime("%H:%M:%S") if hasattr(signal_time, "strftime") else "--:--:--"
     price_text = format_price_value(signal.get("current_price"))
     pct_text = format_pct_value(change_pct)
 
     prefix_map = {
+        "limit_up": "📈 <b>[即將漲停]</b>",
+        "limit_down": "📉 <b>[即將跌停]</b>",
         "entry": "🚀 <b>[進場訊號]</b>",
         "warning": "⚠️ <b>[預警]</b>",
         "day_low_rebound": "📈 <b>[今日低點反彈]</b>",
@@ -1933,7 +1936,7 @@ def append_signal_log(group_name, code, stock_name, signal, change_pct):
 
     level = signal.get("signal_level", "none")
 
-    if level not in ("flash", "warning", "entry", "day_low_rebound", "momentum_window"):
+    if level not in ("flash", "warning", "entry", "day_low_rebound", "momentum_window", "limit_up", "limit_down"):
         return
 
     signal_key = signal.get("signal_key")
@@ -1953,12 +1956,15 @@ def append_signal_log(group_name, code, stock_name, signal, change_pct):
     time_text = signal_time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(signal_time, "strftime") else "-"
 
     level_label = {
+        "limit_up": "即將漲停",
+        "limit_down": "即將跌停",
         "flash": "極早期",
         "warning": "預警",
         "entry": "進場",
         "day_low_rebound": "低點反彈",
         "momentum_window": "區間動能",
     }.get(level, level)
+    
     price_text = format_price_value(signal.get("current_price"))
     pct_text = format_pct_value(change_pct)
 
@@ -2000,6 +2006,12 @@ if "refresh_sec" not in st.session_state:
 
 if "tg_push_enabled" not in st.session_state:
     st.session_state.tg_push_enabled = False
+
+if "limit_approach_pct" not in st.session_state:
+    st.session_state.limit_approach_pct = DEFAULT_LIMIT_APPROACH_PCT
+
+if "limit_approach_cooldowns" not in st.session_state:
+    st.session_state.limit_approach_cooldowns = {}
 
 if "entry_bucket_sec" not in st.session_state:
     st.session_state.entry_bucket_sec = DEFAULT_ENTRY_BUCKET_SEC
@@ -2092,8 +2104,10 @@ if "_entry_signal_toast_messages" not in st.session_state:
 
 if "telegram_pushed_keys" not in st.session_state:
     st.session_state.telegram_pushed_keys = set()
+
+if "telegram_recent_push_by_code" not in st.session_state:
+    st.session_state.telegram_recent_push_by_code = {}
     
-# 新增：用於記錄已發送過的定時 Log 時段，避免重複發送
 if "sent_log_slots" not in st.session_state:
     st.session_state.sent_log_slots = set()
 if "log_date" not in st.session_state:
@@ -2134,6 +2148,8 @@ def queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct):
     price_text = format_price_value(current_price)
 
     prefix_map = {
+        "limit_up": "📈 即將漲停",
+        "limit_down": "📉 即將跌停",
         "entry": "🚀 進場訊號",
         "warning": "⚠️ 預警",
         "day_low_rebound": "📈 今日低點反彈",
@@ -2551,10 +2567,14 @@ with control_cols[4]:
     )
 
 # =============================================================================
-# 左側欄位：參數設定區塊 (合併所有紅框處的設定)
+# 左側欄位：參數設定區塊
 # =============================================================================
 with st.sidebar.expander("⚙️ 參數設定", expanded=True):
     
+    st.markdown("**🚨 漲/跌停預警**")
+    st.number_input("漲跌停預警門檻%", min_value=1.0, max_value=10.0, step=0.5, key="limit_approach_pct", help="距離漲跌停的預警門檻（正負同值，預設 7.5%）")
+    
+    st.markdown("---")
     st.markdown("**🚀 進場預警參數**")
     st.number_input("量能視窗秒", min_value=5, max_value=120, step=5, key="entry_bucket_sec")
     st.number_input("高低點追蹤秒", min_value=10, max_value=300, step=10, key="entry_track_sec")
@@ -2635,7 +2655,7 @@ with st.expander("ℹ️ 訊號邏輯與實測調整說明", expanded=False):
   - **🚀 進場訊號**：預警條件全部成立，再加上 `{int(st.session_state.entry_bucket_sec)}` 秒漲幅或 `{int(st.session_state.entry_track_sec)}` 秒突破高點 / 低點急拉確認，並通過冷卻時間。
   - **📈 今日低點反彈**：不斷記錄當天最低成交價，現價相較今日最低點反彈達門檻即觸發。純看價格、不看量能，用來抓破底後止穩反彈。
   - **📊 區間動能**：固定觀察一段時間窗口（預設 3 分鐘）的漲幅，抓沒有單筆爆量、但持續緩步走高的走勢。
-  - **🔔 Telegram 推送**：推送「預警」、「進場訊號」、「今日低點反彈」、「區間動能」四種提醒至綁定的群組（🔥 極早期不推送，僅記錄於 log）。
+  - **🔔 Telegram 推送**：推送「預警」、「進場訊號」、「今日低點反彈」、「區間動能」、「即將漲/跌停」提醒至綁定的群組（🔥 極早期不推送，僅記錄於 log）。
 - **📝 實測調整說明**：
   - **極早期訊號**：原佔比 43% 但 15 分鐘後續轉正比例僅 23.8%（中位數 0%），已加強為需連續兩筆買盤 ＋ 獨立冷卻。
   - **低點反彈**：門檻 3.0%、冷卻拉長到 240 秒。
@@ -2769,6 +2789,60 @@ for group_name, stocks in st.session_state.stock_groups.items():
 
         if change_pct is not None:
             known_pct_count += 1
+            
+            # === 👇 新增：漲跌停預警偵測 ===
+            limit_threshold = st.session_state.limit_approach_pct
+            limit_cooldowns = st.session_state.limit_approach_cooldowns
+            last_trigger_time = limit_cooldowns.get(code)
+            is_cooldown_ok = True
+            
+            now_ts = datetime.now(TW_TZ)
+            if last_trigger_time is not None:
+                if (now_ts - last_trigger_time).total_seconds() < 1200:
+                    is_cooldown_ok = False
+            
+            limit_signal = None
+            if is_cooldown_ok:
+                if float(change_pct) >= limit_threshold:
+                    limit_signal = {
+                        "active": True,
+                        "warning": False,
+                        "signal_level": "limit_up",
+                        "text": f"📈 即將漲停｜目前漲幅達 {format_pct_value(change_pct)}",
+                        "time": now_ts,
+                        "signal_key": f"{code}_limit_up_{int(now_ts.timestamp())}",
+                        "current_price": current_price
+                    }
+                    limit_cooldowns[code] = now_ts
+                elif float(change_pct) <= -limit_threshold:
+                    limit_signal = {
+                        "active": True,
+                        "warning": False,
+                        "signal_level": "limit_down",
+                        "text": f"📉 即將跌停｜目前跌幅達 {format_pct_value(change_pct)}",
+                        "time": now_ts,
+                        "signal_key": f"{code}_limit_down_{int(now_ts.timestamp())}",
+                        "current_price": current_price
+                    }
+                    limit_cooldowns[code] = now_ts
+                    
+            if limit_signal:
+                signal_msg = {
+                    "group": group_name,
+                    "code": code,
+                    "name": stock_name,
+                    "text": limit_signal.get("text", ""),
+                    "time": limit_signal.get("time"),
+                    "pct": change_pct,
+                    "level": limit_signal.get("signal_level", "none"),
+                }
+                group_signal_messages.append(signal_msg)
+                recent_signals.append(signal_msg)
+                
+                queue_entry_signal_toast(group_name, code, stock_name, limit_signal, change_pct)
+                append_signal_log(group_name, code, stock_name, limit_signal, change_pct)
+                push_telegram_signal(group_name, code, stock_name, limit_signal, change_pct)
+            # === 👆 新增結束 ===
 
             if float(change_pct) > 0:
                 up_count += 1
@@ -2813,8 +2887,6 @@ for group_name, stocks in st.session_state.stock_groups.items():
             
             queue_entry_signal_toast(group_name, code, stock_name, signal, change_pct)
             append_signal_log(group_name, code, stock_name, signal, change_pct)
-            
-            # --- 觸發 Telegram 推送 ---
             push_telegram_signal(group_name, code, stock_name, signal, change_pct)
 
         if day_low_signal.get("active"):
@@ -3056,6 +3128,11 @@ if recent_signals:
                 )
             elif item["level"] == "warning":
                 st.warning(
+                    f"{item['group']}｜{item['code']} {item['name']}\n\n"
+                    f"{item['text']}"
+                )
+            elif item["level"] in ("limit_up", "limit_down"):
+                st.success(
                     f"{item['group']}｜{item['code']} {item['name']}\n\n"
                     f"{item['text']}"
                 )
