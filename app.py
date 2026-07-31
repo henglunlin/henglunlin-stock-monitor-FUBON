@@ -23,6 +23,7 @@ import re
 import json
 import copy
 import time
+import math
 import base64
 import tempfile
 import threading
@@ -480,6 +481,53 @@ def save_yf_close_cache(cache: dict):
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# =============================================================================
+# 漲跌停價格判斷（依台股實際升降單位計算，而非僅用百分比估算）
+# =============================================================================
+def get_price_tick_size(price: float) -> float:
+    """依台股股價級距回傳對應的最小升降單位（元）。"""
+    if price < 10:
+        return 0.01
+    elif price < 50:
+        return 0.05
+    elif price < 100:
+        return 0.1
+    elif price < 500:
+        return 0.5
+    elif price < 1000:
+        return 1.0
+    else:
+        return 5.0
+
+
+def calc_limit_prices(yesterday_close):
+    """
+    依昨收價計算今日實際漲停價 / 跌停價（台股漲跌幅 10%，並依股價級距取整）。
+    漲停價：昨收 * 1.1，依級距無條件捨去。
+    跌停價：昨收 * 0.9，依級距無條件進位。
+    回傳 (limit_up_price, limit_down_price)，若昨收無效則回傳 (None, None)。
+    """
+    if yesterday_close is None:
+        return None, None
+    try:
+        yesterday_close = float(yesterday_close)
+    except (TypeError, ValueError):
+        return None, None
+    if yesterday_close <= 0:
+        return None, None
+
+    raw_up = yesterday_close * 1.1
+    raw_down = yesterday_close * 0.9
+
+    tick_up = get_price_tick_size(raw_up)
+    tick_down = get_price_tick_size(raw_down)
+
+    limit_up_price = math.floor(raw_up / tick_up + 1e-6) * tick_up
+    limit_down_price = math.ceil(raw_down / tick_down - 1e-6) * tick_down
+
+    return round(limit_up_price, 2), round(limit_down_price, 2)
 
 
 def get_yfinance_yesterday_close(symbol: str):
@@ -2013,6 +2061,10 @@ if "limit_approach_pct" not in st.session_state:
 if "limit_approach_cooldowns" not in st.session_state:
     st.session_state.limit_approach_cooldowns = {}
 
+if "limit_locked_state" not in st.session_state:
+    # 記錄每檔股票「今天」是否已經真正觸及漲停/跌停，觸及後當天不再重複跳出「即將」訊號
+    st.session_state.limit_locked_state = {}
+
 if "entry_bucket_sec" not in st.session_state:
     st.session_state.entry_bucket_sec = DEFAULT_ENTRY_BUCKET_SEC
 
@@ -2790,7 +2842,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
         if change_pct is not None:
             known_pct_count += 1
             
-            # === 👇 新增：漲跌停預警偵測 ===
+            # === 👇 新增：漲跌停預警偵測（先判斷是否「真的」漲停/跌停，避免一直跳出「即將」訊號）===
             limit_threshold = st.session_state.limit_approach_pct
             limit_cooldowns = st.session_state.limit_approach_cooldowns
             last_trigger_time = limit_cooldowns.get(code)
@@ -2800,9 +2852,58 @@ for group_name, stocks in st.session_state.stock_groups.items():
             if last_trigger_time is not None:
                 if (now_ts - last_trigger_time).total_seconds() < 1200:
                     is_cooldown_ok = False
-            
+
+            # --- 依昨收計算今日實際漲停價 / 跌停價 ---
+            limit_up_price, limit_down_price = calc_limit_prices(yesterday_close)
+            price_eps = 0.001
+            is_limit_up_hit = (
+                current_price is not None and limit_up_price is not None
+                and float(current_price) >= limit_up_price - price_eps
+            )
+            is_limit_down_hit = (
+                current_price is not None and limit_down_price is not None
+                and float(current_price) <= limit_down_price + price_eps
+            )
+
+            # --- 每檔股票每天的漲停/跌停鎖定狀態（跨日自動重置）---
+            today_str = now_ts.strftime("%Y-%m-%d")
+            locked_state = st.session_state.limit_locked_state.get(code)
+            if locked_state is None or locked_state.get("date") != today_str:
+                locked_state = {"date": today_str, "up": False, "down": False}
+                st.session_state.limit_locked_state[code] = locked_state
+
             limit_signal = None
-            if is_cooldown_ok:
+
+            if is_limit_up_hit:
+                # 已經是真正的漲停：整天只提醒一次，不再重複跳出「即將漲停」
+                if not locked_state["up"]:
+                    limit_signal = {
+                        "active": True,
+                        "warning": False,
+                        "signal_level": "limit_up",
+                        "text": f"🔒 已漲停｜現價 {format_pct_value(change_pct)}",
+                        "time": now_ts,
+                        "signal_key": f"{code}_limit_up_hit_{today_str}",
+                        "current_price": current_price
+                    }
+                    locked_state["up"] = True
+                    limit_cooldowns[code] = now_ts
+            elif is_limit_down_hit:
+                # 已經是真正的跌停：整天只提醒一次，不再重複跳出「即將跌停」
+                if not locked_state["down"]:
+                    limit_signal = {
+                        "active": True,
+                        "warning": False,
+                        "signal_level": "limit_down",
+                        "text": f"🔒 已跌停｜現價 {format_pct_value(change_pct)}",
+                        "time": now_ts,
+                        "signal_key": f"{code}_limit_down_hit_{today_str}",
+                        "current_price": current_price
+                    }
+                    locked_state["down"] = True
+                    limit_cooldowns[code] = now_ts
+            elif is_cooldown_ok:
+                # 尚未真正觸及漲跌停，僅是接近門檻 -> 維持原本「即將漲/跌停」預警
                 if float(change_pct) >= limit_threshold:
                     limit_signal = {
                         "active": True,
@@ -2825,7 +2926,7 @@ for group_name, stocks in st.session_state.stock_groups.items():
                         "current_price": current_price
                     }
                     limit_cooldowns[code] = now_ts
-                    
+
             if limit_signal:
                 signal_msg = {
                     "group": group_name,
